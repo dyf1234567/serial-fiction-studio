@@ -31,6 +31,13 @@ class StoryError(RuntimeError):
     pass
 
 
+def configure_stdio() -> None:
+    """Emit predictable UTF-8 JSON and diagnostics on Windows and Unix."""
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8")
+
+
 def now_iso() -> str:
     return dt.datetime.now(dt.timezone.utc).astimezone().isoformat(timespec="seconds")
 
@@ -535,7 +542,9 @@ def command_record(args: argparse.Namespace) -> dict:
     root, _ = require_project(Path(args.root))
     if args.kind not in EVENT_KINDS - {"chapter"}:
         raise StoryError("record 不接受该事件类型")
-    event = append_event(root, {"kind": args.kind, "subject": args.subject, "predicate": args.predicate, "value": args.value, "chapter": args.chapter, "order": getattr(args, "order", None), "entity_type": getattr(args, "entity_type", None), "source": args.source})
+    value_file = getattr(args, "value_file", None)
+    value = read_text(Path(value_file)).rstrip("\r\n") if value_file else args.value
+    event = append_event(root, {"kind": args.kind, "subject": args.subject, "predicate": args.predicate, "value": value, "chapter": args.chapter, "order": getattr(args, "order", None), "entity_type": getattr(args, "entity_type", None), "source": args.source})
     rebuild_snapshot(root)
     return event
 
@@ -1416,7 +1425,11 @@ def parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="initialize metadata for a novel")
     init.add_argument("root"); init.add_argument("--title", required=True); init.add_argument("--chapters", default="chapters"); init.set_defaults(func=command_init)
     record = sub.add_parser("record", help="append a canon or decision event")
-    record.add_argument("root"); record.add_argument("--kind", required=True, choices=sorted(EVENT_KINDS - {"chapter"})); record.add_argument("--subject", required=True); record.add_argument("--predicate", required=True); record.add_argument("--value", required=True); record.add_argument("--chapter", type=int); record.add_argument("--order", type=float); record.add_argument("--entity-type"); record.add_argument("--source", default="manual"); record.set_defaults(func=command_record)
+    record.add_argument("root"); record.add_argument("--kind", required=True, choices=sorted(EVENT_KINDS - {"chapter"})); record.add_argument("--subject", required=True); record.add_argument("--predicate", required=True)
+    record_value = record.add_mutually_exclusive_group(required=True)
+    record_value.add_argument("--value")
+    record_value.add_argument("--value-file", help="read a UTF-8/GB18030 value from a file; safer for long text and shell-sensitive punctuation")
+    record.add_argument("--chapter", type=int); record.add_argument("--order", type=float); record.add_argument("--entity-type"); record.add_argument("--source", default="manual"); record.set_defaults(func=command_record)
     adopt = sub.add_parser("adopt", help="preview or record existing manuscript chapters")
     adopt.add_argument("root"); adopt.add_argument("--apply", action="store_true"); adopt.add_argument("--confirm"); adopt.set_defaults(func=command_adopt)
     rebuild = sub.add_parser("rebuild", help="reduce the ledger into a snapshot")
@@ -1461,6 +1474,7 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    configure_stdio()
     try:
         args = parser().parse_args(argv)
         result = args.func(args)

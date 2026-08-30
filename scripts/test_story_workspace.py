@@ -1,5 +1,7 @@
 import importlib.util
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from argparse import Namespace
@@ -59,6 +61,33 @@ class StoryWorkspaceTests(unittest.TestCase):
         snapshot = json.loads((self.root / ".storywork" / "snapshot.json").read_text(encoding="utf-8"))
         self.assertEqual(snapshot["facts"][0]["value"], "北塔")
         self.assertEqual(snapshot["setups"][0]["status"], "paid")
+
+    def test_cli_value_file_preserves_chinese_punctuation_and_utf8_output(self):
+        value_path = self.root / "event-value.txt"
+        expected = "单章闭环，同时保留‘母亲失踪与旧车票’作为长篇入口"
+        value_path.write_text(expected + "\n", encoding="utf-8")
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(MODULE_PATH),
+                "record",
+                str(self.root),
+                "--kind",
+                "decision",
+                "--subject",
+                "作品",
+                "--predicate",
+                "ending",
+                "--value-file",
+                str(value_path),
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+        payload = json.loads(completed.stdout.decode("utf-8"))
+        self.assertEqual(payload["value"], expected)
 
     def test_fts_index_finds_direct_answer(self):
         self.chapters.mkdir(parents=True, exist_ok=True)

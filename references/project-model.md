@@ -55,4 +55,10 @@ python scripts/story_workspace.py record <root> --kind setup --subject "银戒" 
 python scripts/story_workspace.py rebuild <root>
 ```
 
+For long Chinese text or punctuation that a shell may reinterpret, write the value to a UTF-8 text file and use `--value-file` instead of `--value`:
+
+```powershell
+python scripts/story_workspace.py record <root> --kind decision --subject "全书" --predicate ending --value-file ending-constraint.txt
+```
+
 Treat imports from older tools as source material, not canon. Index those files or summarize verified facts into new ledger events. This avoids inheriting another tool's hidden assumptions.
