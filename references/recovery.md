@@ -12,9 +12,11 @@ Do not apply an item marked `manual-review`; inspect the destination and digest 
 Create and verify a portable archive:
 
 ```powershell
-python scripts/story_workspace.py backup <root> --out <backup.sfs.zip>
-python scripts/story_workspace.py verify-backup <backup.sfs.zip>
+python scripts/story_workspace.py backup <root> --archive <backup.sfs.zip>
+python scripts/story_workspace.py verify-backup --archive <backup.sfs.zip>
 ```
+
+`backup --out` and positional archive paths remain compatibility aliases, but new instructions should use `--archive` for both commands.
 
 Backups contain operational metadata, semantic audit results, transaction journals, and manuscript chapters. Rebuildable SQLite and HNSW indexes are excluded. Context packs are excluded unless `--include-context` is supplied because they may duplicate large or copyrighted reference excerpts.
 

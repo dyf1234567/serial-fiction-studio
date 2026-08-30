@@ -103,6 +103,51 @@ class StoryWorkspaceTests(unittest.TestCase):
         changed = story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
         self.assertEqual(changed["changed_files"], 1)
 
+    def test_missing_fts5_uses_scan_and_semantic_weight_is_reported_and_transferred(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第0001章.md").write_text("守门人把赤铜钥匙交给沈星。", encoding="utf-8")
+        original = story.supports_fts5
+        story.supports_fts5 = lambda con: False
+        try:
+            built = story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+            self.assertEqual(built["lexical_backend"], "scan")
+            report = story.search_index_report(self.root, "赤铜钥匙", 3, 0.65, 0.35)
+        finally:
+            story.supports_fts5 = original
+        self.assertEqual(report["mode"], "lexical-scan")
+        self.assertEqual(report["effective_weights"], {"lexical": 1.0, "semantic": 0.0})
+        self.assertTrue(report["warnings"])
+        self.assertTrue(report["hits"])
+        self.assertAlmostEqual(report["hits"][0]["score"], 1.0)
+
+    def test_ollama_query_failure_falls_back_with_warning(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第0001章.md").write_text("沈星在旧港等待守门人。", encoding="utf-8")
+        original = story.ollama_embeddings
+        story.ollama_embeddings = lambda endpoint, model, texts: [[1.0, 0.0] for _ in texts]
+        try:
+            story.build_index(self.root, [], "ollama", "fake", "http://invalid", "exact")
+            def unavailable(endpoint, model, texts):
+                raise story.StoryError("测试端点离线")
+            story.ollama_embeddings = unavailable
+            report = story.search_index_report(self.root, "旧港", 3, 0.4, 0.6)
+        finally:
+            story.ollama_embeddings = original
+        self.assertEqual(report["effective_weights"], {"lexical": 1.0, "semantic": 0.0})
+        self.assertTrue(any("端点离线" in warning for warning in report["warnings"]))
+        self.assertTrue(report["hits"])
+
+    def test_cli_keeps_legacy_aliases_and_exposes_clear_names(self):
+        cli = story.parser()
+        mechanical = cli.parse_args(["mechanical-review", str(self.root), "--session", "s", "--draft", "d.md"])
+        legacy_review = cli.parse_args(["review", str(self.root), "--session", "s", "--draft", "d.md"])
+        backup = cli.parse_args(["backup", str(self.root), "--archive", "backup.sfs.zip"])
+        verify = cli.parse_args(["verify-backup", "--archive", "backup.sfs.zip"])
+        self.assertIs(mechanical.func, story.command_review)
+        self.assertIs(legacy_review.func, story.command_review)
+        self.assertEqual(backup.archive, "backup.sfs.zip")
+        self.assertEqual(verify.archive, "backup.sfs.zip")
+
     def test_adopt_previews_then_records_existing_chapters(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
         (self.chapters / "第1章-起点.md").write_text("# 第1章 起点\n\n故事开始。", encoding="utf-8")

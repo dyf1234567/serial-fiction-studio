@@ -15,10 +15,10 @@ The pack separates current facts, open setups, decisions, recent manuscript, and
 Write to a new draft file; never overwrite an accepted chapter. Preserve causal links, viewpoint knowledge, physical state, relationships, setup timing, and forbidden revelations.
 
 ```powershell
-python scripts/story_workspace.py review <root> --session <session-id> --draft <draft-file>
+python scripts/story_workspace.py mechanical-review <root> --session <session-id> --draft <draft-file>
 ```
 
-Mechanical checks are triage, not a quality verdict. Read the draft and report continuity conflicts, unsupported motive or voice shifts, premature payoff, missing consequences, repeated beats, and weak forward pressure.
+`mechanical-review` checks length, forbidden phrases, frozen-plan integrity, plan phrase constraints, and repeated sentences. It is triage, not semantic review or a quality verdict. The old `review` spelling remains a compatibility alias. After it runs, the host model or requested reviewer agents must still read the draft and report continuity conflicts, unsupported motive or voice shifts, premature payoff, missing consequences, repeated beats, and weak forward pressure.
 
 If a frozen plan exists, register the actual scene results and run `deviation` before acceptance. Hard review errors and hard plan-deviation errors block `accept`; soft pacing differences remain reviewable risks.
 

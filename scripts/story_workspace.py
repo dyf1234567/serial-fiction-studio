@@ -283,7 +283,20 @@ def connect_db(root: Path) -> sqlite3.Connection:
     return connection
 
 
-def initialize_index_schema(con: sqlite3.Connection) -> None:
+def table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return con.execute("SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name=?", (name,)).fetchone() is not None
+
+
+def supports_fts5(con: sqlite3.Connection) -> bool:
+    try:
+        con.execute("CREATE VIRTUAL TABLE temp.__storywork_fts5_probe USING fts5(value)")
+        con.execute("DROP TABLE temp.__storywork_fts5_probe")
+        return True
+    except sqlite3.OperationalError:
+        return False
+
+
+def initialize_index_schema(con: sqlite3.Connection, force_lexical_scan: bool = False) -> str:
     con.executescript(
         """
         CREATE TABLE IF NOT EXISTS docs(
@@ -296,7 +309,6 @@ def initialize_index_schema(con: sqlite3.Connection) -> None:
             text TEXT NOT NULL,
             vector TEXT
         );
-        CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(doc_id UNINDEXED, title, terms, tokenize='unicode61');
         CREATE TABLE IF NOT EXISTS source_files(
             file_key TEXT PRIMARY KEY,
             path TEXT NOT NULL,
@@ -307,13 +319,47 @@ def initialize_index_schema(con: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
         """
     )
+    lexical_backend = "scan"
+    if not force_lexical_scan and supports_fts5(con):
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS docs_fts USING fts5(doc_id UNINDEXED, title, terms, tokenize='unicode61')")
+        lexical_backend = "fts5"
+    else:
+        con.execute("CREATE TABLE IF NOT EXISTS docs_lexical(doc_id INTEGER PRIMARY KEY, title TEXT NOT NULL, terms TEXT NOT NULL)")
+    lexical_table = "docs_fts" if lexical_backend == "fts5" else "docs_lexical"
+    indexed_ids = {int(row[0]) for row in con.execute(f"SELECT doc_id FROM {lexical_table}")}
+    for row in con.execute("SELECT id,title,text FROM docs"):
+        doc_id = int(row["id"])
+        if doc_id in indexed_ids:
+            continue
+        if lexical_backend == "fts5":
+            con.execute("INSERT INTO docs_fts(rowid,doc_id,title,terms) VALUES(?,?,?,?)", (doc_id, doc_id, row["title"], search_terms(row["text"])))
+        else:
+            con.execute("INSERT INTO docs_lexical(doc_id,title,terms) VALUES(?,?,?)", (doc_id, row["title"], search_terms(row["text"])))
     con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema','2')")
+    con.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('lexical_backend',?)", (lexical_backend,))
+    return lexical_backend
+
+
+def insert_lexical_row(con: sqlite3.Connection, lexical_backend: str, doc_id: int, title: str, text: str) -> None:
+    terms = search_terms(text)
+    if lexical_backend == "fts5":
+        con.execute("INSERT INTO docs_fts(rowid,doc_id,title,terms) VALUES(?,?,?,?)", (doc_id, doc_id, title, terms))
+    else:
+        con.execute("INSERT INTO docs_lexical(doc_id,title,terms) VALUES(?,?,?)", (doc_id, title, terms))
 
 
 def delete_index_file(con: sqlite3.Connection, file_key: str) -> None:
     ids = [int(row[0]) for row in con.execute("SELECT id FROM docs WHERE file_key=?", (file_key,))]
     if ids:
-        con.executemany("DELETE FROM docs_fts WHERE rowid=?", [(doc_id,) for doc_id in ids])
+        if table_exists(con, "docs_fts"):
+            try:
+                con.executemany("DELETE FROM docs_fts WHERE rowid=?", [(doc_id,) for doc_id in ids])
+            except sqlite3.OperationalError:
+                # A database created with FTS5 may later be opened by a Python
+                # build without the module. The scan table remains usable.
+                pass
+        if table_exists(con, "docs_lexical"):
+            con.executemany("DELETE FROM docs_lexical WHERE doc_id=?", [(doc_id,) for doc_id in ids])
     con.execute("DELETE FROM docs WHERE file_key=?", (file_key,))
     con.execute("DELETE FROM source_files WHERE file_key=?", (file_key,))
 
@@ -357,7 +403,7 @@ def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: 
         con.close()
         database.unlink()
         con = connect_db(root)
-    initialize_index_schema(con)
+    lexical_backend = initialize_index_schema(con)
     previous_meta = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM meta")}
     con.commit()
     pending: list[tuple[int, str]] = []
@@ -384,7 +430,7 @@ def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: 
         for ordinal, chunk in enumerate(chunk_text(read_text(file_path))):
             cursor = con.execute("INSERT INTO docs(file_key,source,path,title,ordinal,text,vector) VALUES(?,?,?,?,?,?,NULL)", (file_key, source_type, file_key, title, ordinal, chunk))
             doc_id = int(cursor.lastrowid)
-            con.execute("INSERT INTO docs_fts(rowid,doc_id,title,terms) VALUES(?,?,?,?)", (doc_id, doc_id, title, search_terms(chunk)))
+            insert_lexical_row(con, lexical_backend, doc_id, title, chunk)
             if embeddings == "ollama":
                 pending.append((doc_id, chunk))
         con.execute("INSERT INTO source_files(file_key,path,source,title,sha256) VALUES(?,?,?,?,?)", (file_key, file_key, source_type, title, digest))
@@ -397,7 +443,7 @@ def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: 
             text = " | ".join(str(event.get(key, "")) for key in ("kind", "subject", "predicate", "value", "evidence"))
             cursor = con.execute("INSERT INTO docs(file_key,source,path,title,ordinal,text,vector) VALUES(?,?,?,?,?,?,NULL)", ("@ledger", "ledger", "ledger.jsonl", str(event.get("kind")), ordinal, text))
             doc_id = int(cursor.lastrowid)
-            con.execute("INSERT INTO docs_fts(rowid,doc_id,title,terms) VALUES(?,?,?,?)", (doc_id, doc_id, str(event.get("kind")), search_terms(text)))
+            insert_lexical_row(con, lexical_backend, doc_id, str(event.get("kind")), text)
             if embeddings == "ollama":
                 pending.append((doc_id, text))
             ordinal += 1
@@ -429,7 +475,7 @@ def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: 
     con.commit()
     doc_count = int(con.execute("SELECT COUNT(*) FROM docs").fetchone()[0])
     con.close()
-    return {"files": len(discovered), "chunks": doc_count, "changed_files": len(changed_keys), "removed_files": len(removed_keys), "embedded_chunks": len(pending), "ann": ann_backend, **meta}
+    return {"files": len(discovered), "chunks": doc_count, "changed_files": len(changed_keys), "removed_files": len(removed_keys), "embedded_chunks": len(pending), "lexical_backend": lexical_backend, "ann": ann_backend, **meta}
 
 
 def command_index(args: argparse.Namespace) -> dict:
@@ -447,25 +493,67 @@ def command_index(args: argparse.Namespace) -> dict:
     return result
 
 
-def search_index(root: Path, query: str, limit: int, lexical_weight: float, semantic_weight: float) -> list[dict]:
+def search_index_report(root: Path, query: str, limit: int, lexical_weight: float, semantic_weight: float) -> dict:
     root, _ = require_project(root)
+    if lexical_weight < 0 or semantic_weight < 0 or lexical_weight + semantic_weight <= 0:
+        raise StoryError("检索权重必须为非负数，且总和必须大于 0")
+    requested_weights = {"lexical": lexical_weight, "semantic": semantic_weight}
     if not db_path(root).exists():
-        return []
+        return {
+            "mode": "unindexed",
+            "lexical_backend": None,
+            "requested_weights": requested_weights,
+            "effective_weights": {"lexical": 0.0, "semantic": 0.0},
+            "warnings": ["检索索引尚未建立；请先运行 index"],
+            "hits": [],
+        }
     con = connect_db(root)
+    meta = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM meta")}
+    lexical_backend = meta.get("lexical_backend") or ("fts5" if table_exists(con, "docs_fts") else "scan")
     candidates: dict[int, dict] = {}
-    rows = con.execute(
-        "SELECT d.*, bm25(docs_fts) AS rank FROM docs_fts JOIN docs d ON d.id=docs_fts.doc_id WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?",
-        (query_expression(query), max(limit * 6, 30)),
-    ).fetchall()
+    candidate_limit = max(limit * 6, 30)
+    if lexical_backend == "fts5" and table_exists(con, "docs_fts"):
+        rows = con.execute(
+            "SELECT d.*, bm25(docs_fts) AS rank FROM docs_fts JOIN docs d ON d.id=docs_fts.doc_id WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?",
+            (query_expression(query), candidate_limit),
+        ).fetchall()
+    else:
+        query_tokens = set(search_terms(query).split())
+        scored_rows: list[tuple[float, sqlite3.Row]] = []
+        lexical_table = "docs_lexical" if table_exists(con, "docs_lexical") else None
+        if lexical_table:
+            for row in con.execute("SELECT d.*,l.terms FROM docs_lexical l JOIN docs d ON d.id=l.doc_id"):
+                terms = set(str(row["terms"]).split())
+                overlap = len(query_tokens & terms)
+                if overlap:
+                    scored_rows.append((overlap / max(len(query_tokens), 1), row))
+        rows = [row for _, row in sorted(scored_rows, key=lambda pair: pair[0], reverse=True)[:candidate_limit]]
     for position, row in enumerate(rows):
         item = dict(row)
+        item.pop("terms", None)
         item["lexical"] = 1.0 / (position + 1)
         item["semantic"] = 0.0
         candidates[int(row["id"])] = item
 
-    meta = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM meta")}
-    if semantic_weight > 0 and meta.get("embeddings") == "ollama":
-        vector = ollama_embeddings(meta["endpoint"], meta["model"], [query])[0]
+    warnings: list[str] = []
+    effective_lexical = lexical_weight
+    effective_semantic = semantic_weight
+    semantic_active = False
+    vector_count = int(con.execute("SELECT COUNT(*) FROM docs WHERE vector IS NOT NULL").fetchone()[0])
+    if semantic_weight > 0 and meta.get("embeddings") == "ollama" and vector_count > 0:
+        try:
+            vector = ollama_embeddings(meta["endpoint"], meta["model"], [query])[0]
+            semantic_active = True
+        except StoryError as exc:
+            warnings.append(f"语义查询不可用，已将语义权重转交词法检索：{exc}")
+    elif semantic_weight > 0:
+        warnings.append("索引没有可用 embedding，已将语义权重转交词法检索；如需语义召回，请使用 index --embeddings ollama 重建索引")
+
+    if semantic_weight > 0 and not semantic_active:
+        effective_lexical += effective_semantic
+        effective_semantic = 0.0
+
+    if semantic_active:
         semantic_rows: list[tuple[sqlite3.Row, float]] = []
         if meta.get("ann") == "hnsw" and (state_path(root) / "library.hnsw.bin").exists():
             try:
@@ -489,11 +577,33 @@ def search_index(root: Path, query: str, limit: int, lexical_weight: float, sema
             item["semantic"] = score
 
     for item in candidates.values():
-        item["score"] = lexical_weight * item["lexical"] + semantic_weight * item["semantic"]
+        item["score"] = effective_lexical * item["lexical"] + effective_semantic * item["semantic"]
         item.pop("vector", None)
         item.pop("rank", None)
     con.close()
-    return sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[:limit]
+    if semantic_active and effective_lexical > 0:
+        mode = "hybrid"
+    elif semantic_active:
+        mode = "vector"
+    else:
+        mode = "fts5" if lexical_backend == "fts5" else "lexical-scan"
+    return {
+        "mode": mode,
+        "lexical_backend": lexical_backend,
+        "requested_weights": requested_weights,
+        "effective_weights": {"lexical": effective_lexical, "semantic": effective_semantic},
+        "warnings": warnings,
+        "hits": sorted(candidates.values(), key=lambda item: item["score"], reverse=True)[:limit],
+    }
+
+
+def search_index(root: Path, query: str, limit: int, lexical_weight: float, semantic_weight: float) -> list[dict]:
+    """Compatibility API for callers that only need passages."""
+    return search_index_report(root, query, limit, lexical_weight, semantic_weight)["hits"]
+
+
+def command_query(args: argparse.Namespace) -> dict:
+    return search_index_report(Path(args.root), args.query, args.limit, args.lexical_weight, args.semantic_weight)
 
 
 def natural_key(path: Path) -> tuple:
@@ -996,10 +1106,11 @@ def command_begin(args: argparse.Namespace) -> dict:
     session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     plan = active_plan(root, args.chapter)
     effective_goal = plan["goal"] if plan else args.goal
-    results = search_index(root, args.query or effective_goal, args.limit, 0.65, 0.35)
+    retrieval = search_index_report(root, args.query or effective_goal, args.limit, 0.65, 0.35)
+    results = retrieval["hits"]
     session_dir = state_path(root) / "sessions" / session_id
     plan_digest = plan_payload_digest(plan) if plan else None
-    session = {"format": "serial-fiction-session/v1", "id": session_id, "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "review": None}
+    session = {"format": "serial-fiction-session/v1", "id": session_id, "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "retrieval": {key: retrieval[key] for key in ("mode", "lexical_backend", "requested_weights", "effective_weights", "warnings")}, "review": None}
     write_json(session_dir / "session.json", session)
     sections = [f"# 第 {args.chapter} 章创作上下文", f"\n## 本章目标\n\n{effective_goal}", "\n" + snapshot_markdown(snapshot)]
     if plan:
@@ -1008,13 +1119,15 @@ def command_begin(args: argparse.Namespace) -> dict:
     for name, text in recent_chapters(root, manifest):
         sections.append(f"\n### {name}\n\n{text}")
     sections.append("\n## 检索证据（须核验）")
+    if retrieval["warnings"]:
+        sections.append("\n### 检索降级说明\n\n" + "\n".join(f"- {warning}" for warning in retrieval["warnings"]))
     for item in results:
         sections.append(f"\n### {item['title']} · {item['path']} · score={item['score']:.3f}\n\n{item['text']}")
     context = "\n".join(sections).strip() + "\n"
     context_path = Path(args.out).resolve() if args.out else session_dir / "context.md"
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_text(context, encoding="utf-8")
-    return {"session": session_id, "context": str(context_path), "retrieved": len(results)}
+    return {"session": session_id, "context": str(context_path), "retrieved": len(results), "retrieval": session["retrieval"]}
 
 
 def repeated_lines(text: str) -> list[str]:
@@ -1392,7 +1505,10 @@ def backup_members(root: Path, manifest: dict, include_context: bool) -> list[tu
 
 def command_backup(args: argparse.Namespace) -> dict:
     root, manifest = require_project(Path(args.root))
-    destination = Path(args.out).resolve()
+    destination_value = getattr(args, "archive", None) or getattr(args, "out", None) or getattr(args, "archive_positional", None)
+    if not destination_value:
+        raise StoryError("backup 需要 --archive <文件路径>")
+    destination = Path(destination_value).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
     members = backup_members(root, manifest, args.include_context)
     hashes = []
@@ -1408,7 +1524,10 @@ def command_backup(args: argparse.Namespace) -> dict:
 
 
 def command_verify_backup(args: argparse.Namespace) -> dict:
-    archive_path = Path(args.archive).resolve()
+    archive_value = getattr(args, "archive", None) or getattr(args, "archive_positional", None)
+    if not archive_value:
+        raise StoryError("verify-backup 需要 --archive <文件路径>")
+    archive_path = Path(archive_value).resolve()
     failures: list[str] = []
     with zipfile.ZipFile(archive_path, "r") as archive:
         manifest = json.loads(archive.read("backup-manifest.json").decode("utf-8"))
@@ -1437,10 +1556,12 @@ def parser() -> argparse.ArgumentParser:
     index = sub.add_parser("index", help="rebuild lexical and optional semantic retrieval")
     index.add_argument("root"); index.add_argument("--source", action="append"); index.add_argument("--embeddings", choices=["none", "ollama"]); index.add_argument("--model"); index.add_argument("--endpoint"); index.add_argument("--ann", choices=["auto", "exact", "hnsw"]); index.set_defaults(func=command_index)
     query = sub.add_parser("query", help="retrieve relevant passages")
-    query.add_argument("root"); query.add_argument("query"); query.add_argument("--limit", type=int, default=8); query.add_argument("--lexical-weight", type=float, default=0.65); query.add_argument("--semantic-weight", type=float, default=0.35); query.set_defaults(func=lambda args: search_index(Path(args.root), args.query, args.limit, args.lexical_weight, args.semantic_weight))
+    query.add_argument("root"); query.add_argument("query"); query.add_argument("--limit", type=int, default=8); query.add_argument("--lexical-weight", type=float, default=0.65); query.add_argument("--semantic-weight", type=float, default=0.35); query.set_defaults(func=command_query)
     begin = sub.add_parser("begin", help="create a draft session and context pack")
     begin.add_argument("root"); begin.add_argument("--chapter", type=int, required=True); begin.add_argument("--goal", required=True); begin.add_argument("--query"); begin.add_argument("--limit", type=int, default=8); begin.add_argument("--out"); begin.set_defaults(func=command_begin)
-    review = sub.add_parser("review", help="run deterministic checks on a draft")
+    mechanical_review = sub.add_parser("mechanical-review", help="run deterministic mechanical checks on a draft")
+    mechanical_review.add_argument("root"); mechanical_review.add_argument("--session", required=True); mechanical_review.add_argument("--draft", required=True); mechanical_review.set_defaults(func=command_review)
+    review = sub.add_parser("review", help="compatibility alias for mechanical-review")
     review.add_argument("root"); review.add_argument("--session", required=True); review.add_argument("--draft", required=True); review.set_defaults(func=command_review)
     accept = sub.add_parser("accept", help="commit an approved, reviewed draft")
     accept.add_argument("root"); accept.add_argument("--session", required=True); accept.add_argument("--draft", required=True); accept.add_argument("--confirm", required=True); accept.set_defaults(func=command_accept)
@@ -1467,9 +1588,9 @@ def parser() -> argparse.ArgumentParser:
     audit_finalize = sub.add_parser("audit-finalize", help="finalize a fully reviewed semantic audit")
     audit_finalize.add_argument("root"); audit_finalize.add_argument("--audit", required=True); audit_finalize.set_defaults(func=command_audit_finalize)
     backup = sub.add_parser("backup", help="create a verified portable project archive")
-    backup.add_argument("root"); backup.add_argument("--out", required=True); backup.add_argument("--include-context", action="store_true"); backup.set_defaults(func=command_backup)
+    backup.add_argument("root"); backup.add_argument("archive_positional", nargs="?", help="legacy positional archive path"); backup.add_argument("--archive", "--out", dest="archive", help="destination archive path (--out remains an alias)"); backup.add_argument("--include-context", action="store_true"); backup.set_defaults(func=command_backup)
     verify = sub.add_parser("verify-backup", help="verify every member digest in a backup")
-    verify.add_argument("archive"); verify.set_defaults(func=command_verify_backup)
+    verify.add_argument("archive_positional", nargs="?", help="legacy positional archive path"); verify.add_argument("--archive", help="archive path"); verify.set_defaults(func=command_verify_backup)
     return cli
 
 
