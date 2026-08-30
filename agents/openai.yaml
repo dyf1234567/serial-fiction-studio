@@ -1,0 +1,4 @@
+interface:
+  display_name: "Serial Fiction Studio"
+  short_description: "Maintain continuity in long-form fiction projects."
+  default_prompt: "Use $serial-fiction-studio to continue this fiction project while preserving canon, chronology, and unresolved setup."

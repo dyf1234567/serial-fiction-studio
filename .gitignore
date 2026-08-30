@@ -1,0 +1,44 @@
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+
+# Serial Fiction Studio project state and generated retrieval data
+.storywork/
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+*.db
+*.hnsw
+*.index
+*.npy
+*.npz
+
+# Manuscripts, corpora, context packs, and backups are private project data
+chapters/
+manuscripts/
+projects/
+corpora/
+author-corpora/
+context-packs/
+backups/
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
