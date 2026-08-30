@@ -59,11 +59,8 @@ Embedding 服务是可选外部能力。项目可以只用 FTS5，也可以连�
 - SQLite、HNSW 或 embedding 索引
 - 自动备份和生成的上下文包
 
-详见 [PROVENANCE.md](PROVENANCE.md)。公开可见不等于获得使用、修改或再分发授权；本仓库当前未附加开源许可证。
-
 ## 验证
 
 ```powershell
 python -m unittest discover -s scripts -p "test_*.py"
 ```
-
