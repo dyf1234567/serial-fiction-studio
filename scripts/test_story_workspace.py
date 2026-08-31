@@ -104,6 +104,14 @@ class StoryWorkspaceTests(unittest.TestCase):
         changed = story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
         self.assertEqual(changed["changed_files"], 1)
 
+    def test_single_han_character_query_uses_literal_fallback(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第0001章.md").write_text("沈星在旧港等待守门人。", encoding="utf-8")
+        story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        report = story.search_index_report(self.root, "沈", 3, 1.0, 0.0)
+        self.assertTrue(report["hits"])
+        self.assertIn("沈星", report["hits"][0]["text"])
+
     def test_relative_reference_source_is_persisted_stably_and_missing_source_preserves_index(self):
         first_cwd = Path(self.temp.name) / "first-cwd"
         second_cwd = Path(self.temp.name) / "second-cwd"
@@ -212,6 +220,37 @@ class StoryWorkspaceTests(unittest.TestCase):
         repeated = story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
         self.assertEqual(repeated["applied"], 0)
         self.assertIn("已有接受记录", repeated["skipped"][0]["reason"])
+
+    def test_chapter_repair_reconciles_legacy_duplicate_records(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        path = self.chapters / "第0003章.md"
+        path.write_text("沈星踏入北塔。", encoding="utf-8")
+        digest = __import__("hashlib").sha256(path.read_bytes()).hexdigest()
+        first = story.append_event(self.root, {"kind": "chapter", "subject": path.name, "predicate": "adopted", "value": digest, "chapter": 3, "source": "legacy"})
+        second = story.append_event(self.root, {"kind": "chapter", "subject": path.name, "predicate": "accepted", "value": digest, "chapter": 3, "source": "legacy"})
+        story.rebuild_snapshot(self.root)
+        self.assertEqual(len(story.accepted_chapter_records(self.root, 3)), 2)
+        result = story.command_chapter_repair(Namespace(root=str(self.root), chapter=3, keep=first["id"], confirm="REPAIR-3"))
+        self.assertEqual(len(story.accepted_chapter_records(self.root, 3)), 1)
+        self.assertEqual(result["retired"], [second["id"]])
+        self.assertEqual(len(story.load_json(self.root / ".storywork" / "snapshot.json")["chapter_history"]), 3)
+
+    def test_old_audit_manifest_returns_compatibility_error(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第0001章.md").write_text("审计章节。", encoding="utf-8")
+        audit = story.command_audit_pack(Namespace(root=str(self.root), scope="volume", from_chapter=1, to_chapter=1, batch_size=1))
+        manifest_path = self.root / ".storywork" / "audits" / audit["audit"] / "manifest.json"
+        manifest = story.load_json(manifest_path)
+        manifest.pop("memory", None)
+        story.write_json(manifest_path, manifest)
+        findings = self.root / "findings.json"
+        findings.write_text("[]", encoding="utf-8")
+        completed = subprocess.run([sys.executable, str(MODULE_PATH), "audit-submit", str(self.root), "--audit", audit["audit"], "--batch", "1", "--findings", str(findings)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+        stderr = completed.stderr.decode("utf-8")
+        self.assertEqual(completed.returncode, 2, stderr)
+        self.assertIn("旧版审计 manifest", stderr)
+        self.assertNotIn("PermissionError", stderr)
+        self.assertNotIn("Traceback", stderr)
 
     def test_begin_and_accept_reject_an_already_occupied_chapter_number(self):
         self.chapters.mkdir(parents=True, exist_ok=True)

@@ -13,6 +13,7 @@ Skill 自身负责确定性工作：项目状态、事实账本、词法与向�
 - 初始化新项目或接管已有小说
 - 维护追加式 canon 账本与当前状态快照
 - 使用 FTS5、普通词法扫描和可选 embedding 检索
+- 单个汉字查询会启用正文子串兜底，兼容已有索引并提示其较宽的召回范围
 - 生成紧凑写作上下文，避免每次加载整本小说
 - 通过 `begin → mechanical-review → accept` 管理草稿事务
 - 通过 `revise-begin → mechanical-review → accept` 安全修订已接受章节并保留旧版本
@@ -83,6 +84,14 @@ python scripts/story_workspace.py query <小说目录> "谁拿走了银戒" `
 ```
 
 查询结果会明确返回检索模式、请求权重、实际权重、降级警告和命中内容。如果没有向量或 Ollama 暂时离线，语义权重会自动转交给词法检索，不再静默失效。
+
+如果迁移旧项目后审计发现同一章有多个当前接受记录，可先明确选择要保留的事件：
+
+```powershell
+python scripts/story_workspace.py chapter-repair <root> --chapter 3 --keep <event-id> --confirm REPAIR-3
+```
+
+该命令只追加可追溯的收敛事件，不会自动删除其他正文文件；后续 `audit` 若发现孤儿文件，请人工归档。
 
 如果索引元数据与实际 SQLite 表不一致，查询会明确返回降级或 `index-unavailable`，并提示重新运行 `index`，不会把空结果伪报为正常 FTS5 查询。
 

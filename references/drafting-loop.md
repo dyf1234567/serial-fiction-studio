@@ -48,4 +48,6 @@ python scripts/story_workspace.py accept <root> --session <revision-session> --d
 
 `revise-begin` also reconciles a chapter that was edited outside the workflow: it records both the canon digest and the observed file digest. Acceptance fails if the file changes again after the revision session starts. The previous file is preserved under `.storywork/revisions/`, and the new chapter event explicitly supersedes the former version. Re-extract and approve affected canon facts after acceptance; the tool does not guess which earlier facts should be retracted.
 
+如果旧项目的 `audit` 报告同一章存在多个当前接受记录，先按 [audits.md](audits.md) 使用 `chapter-repair` 明确收敛，再开始 `revise-begin`；工具不会替你猜测应保留哪一版。
+
 When a style pack is active, use its abstract tendencies and safe examples. Do not reproduce distinctive passages or substitute style evidence for story evidence.

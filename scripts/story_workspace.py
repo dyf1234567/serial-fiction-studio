@@ -213,6 +213,12 @@ def reduce_events(events: Sequence[dict]) -> dict:
             number = int(event.get("chapter") or 0)
             chapter_history.append(event)
             active = chapter_slots.setdefault(number, [])
+            resolves = {str(item) for item in event.get("resolves", []) if str(item)}
+            if resolves:
+                # A guarded reconciliation event replaces the whole active
+                # slot while retaining every prior event in chapter_history.
+                active[:] = [event]
+                continue
             supersedes = str(event.get("supersedes", ""))
             matches = [index for index, item in enumerate(active) if str(item.get("id", "")) == supersedes]
             if supersedes and len(matches) == 1:
@@ -603,6 +609,19 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
                 if overlap:
                     scored_rows.append((overlap / max(len(query_tokens), 1), row))
         rows = [row for _, row in sorted(scored_rows, key=lambda pair: pair[0], reverse=True)[:candidate_limit]]
+    # FTS5 bigram tokenization cannot match a one-character Han query. Add a
+    # literal substring fallback so names such as “沈” still retrieve text
+    # from existing indexes without requiring a full reindex.
+    single_han = list(dict.fromkeys(token for token in search_terms(query).split() if len(token) == 1 and re.fullmatch(r"[\u3400-\u9fff]", token)))
+    if lexical_available and single_han:
+        existing_ids = {int(row["id"]) for row in rows}
+        fallback_rows: list[sqlite3.Row] = []
+        for token in single_han:
+            for row in con.execute("SELECT * FROM docs WHERE text LIKE ? LIMIT ?", (f"%{token}%", candidate_limit)):
+                if int(row["id"]) not in existing_ids:
+                    existing_ids.add(int(row["id"]))
+                    fallback_rows.append(row)
+        rows = list(rows) + fallback_rows[: max(0, candidate_limit - len(rows))]
     for position, row in enumerate(rows):
         item = dict(row)
         item.pop("terms", None)
@@ -700,20 +719,6 @@ def recent_chapters(root: Path, manifest: dict, count: int = 2, chars: int = 500
     return [(path.name, read_text(path)[-chars:]) for path in files[-count:]]
 
 
-def snapshot_markdown(snapshot: dict) -> str:
-    lines = ["## 已确认事实"]
-    for item in snapshot.get("facts", []):
-        lines.append(f"- {item.get('subject')} / {item.get('predicate')}: {item.get('value')}（第{item.get('chapter', '?')}章）")
-    lines.append("\n## 未回收伏笔")
-    for item in snapshot.get("setups", []):
-        if item.get("status") == "open":
-            lines.append(f"- [{item.get('id')}] {item.get('subject')} / {item.get('predicate')}: {item.get('value')}")
-    lines.append("\n## 创作决定")
-    for item in snapshot.get("decisions", []):
-        lines.append(f"- {item.get('predicate')}: {item.get('value')}")
-    return "\n".join(lines)
-
-
 def item_position(item: dict) -> tuple[int, float]:
     try:
         order = float(item.get("order") or 0)
@@ -760,7 +765,7 @@ def select_memory_items(items: list[dict], limit: int, focus: str, critical_pred
 
     add(balanced_critical, max(1, limit // 2))
     add((item for item in reversed(ordered) if related(item)), max(1, limit // 5))
-    add(ordered if oldest_first else ordered, max(1, limit // 8))
+    add(ordered, max(1, limit // 8))
     add(ordered if oldest_first else reversed(ordered), limit - len(selected))
     if len(selected) < limit:
         add(reversed(ordered) if oldest_first else ordered, limit - len(selected))
@@ -905,6 +910,35 @@ def command_adopt(args: argparse.Namespace) -> dict:
             applied += 1
         rebuild_snapshot(root)
     return {"mode": "apply" if args.apply else "preview", "planned": planned, "skipped": skipped, "applied": applied}
+
+
+def command_chapter_repair(args: argparse.Namespace) -> dict:
+    """Reconcile legacy duplicate active chapter records without deleting files."""
+    root, manifest = require_project(Path(args.root))
+    chapter = int(args.chapter)
+    records = accepted_chapter_records(root, chapter)
+    if len(records) < 2:
+        raise StoryError(f"第 {chapter} 章没有可收敛的重复接受记录")
+    expected = f"REPAIR-{chapter}"
+    if args.confirm != expected:
+        raise StoryError(f"修复重复章节需要 --confirm {expected}")
+    keep_id = str(args.keep)
+    keep = next((item for item in records if str(item.get("id")) == keep_id), None)
+    if keep is None:
+        raise StoryError(f"--keep 未指向第 {chapter} 章当前接受记录：{keep_id}")
+    destination = resolve_manifest_path(root, manifest["chapters"]) / str(keep.get("subject", ""))
+    if not destination.is_file():
+        raise StoryError(f"保留记录对应正文不存在：{destination}")
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    if digest != str(keep.get("value", "")):
+        raise StoryError("保留记录对应正文摘要已变化；请先通过 revise-begin 修订后再收敛")
+    event = append_event(root, {
+        "kind": "chapter", "subject": destination.name, "predicate": "reconciled",
+        "value": digest, "chapter": chapter, "resolves": [str(item.get("id")) for item in records],
+        "selected_event": keep_id, "source": "chapter-repair",
+    })
+    rebuild_snapshot(root)
+    return {"chapter": chapter, "event": event, "retired": [str(item.get("id")) for item in records if str(item.get("id")) != keep_id], "note": "未删除其他正文文件；如为不同文件名，请人工归档后重新 audit"}
 
 
 def validate_proposed_event(item: dict, chapter: int) -> dict:
@@ -1786,8 +1820,16 @@ def command_audit_submit(args: argparse.Namespace) -> dict:
     manifest_path = audit_dir / "manifest.json"
     audit = load_json(manifest_path)
     memory = audit.get("memory", {})
+    if not isinstance(memory, dict) or not str(memory.get("path", "")).strip() or not str(memory.get("sha256", "")).strip():
+        raise StoryError("旧版审计 manifest 缺少共享 memory；请重新运行 audit-pack 生成兼容的审计包")
     memory_path = resolve_manifest_path(root, str(memory.get("path", "")))
-    if not memory_path.exists() or hashlib.sha256(memory_path.read_bytes()).hexdigest() != memory.get("sha256"):
+    if not memory_path.is_file():
+        raise StoryError("审计共享记忆缺失或摘要不匹配，请重新生成 audit-pack")
+    try:
+        memory_digest = hashlib.sha256(memory_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        raise StoryError(f"无法读取审计共享记忆，请重新生成 audit-pack：{exc}") from exc
+    if memory_digest != memory.get("sha256"):
         raise StoryError("审计共享记忆缺失或摘要不匹配，请重新生成 audit-pack")
     batch = next((item for item in audit.get("batches", []) if int(item["batch"]) == args.batch), None)
     if batch is None:
@@ -1895,6 +1937,8 @@ def parser() -> argparse.ArgumentParser:
     record.add_argument("--chapter", type=int); record.add_argument("--order", type=float); record.add_argument("--entity-type"); record.add_argument("--source", default="manual"); record.set_defaults(func=command_record)
     adopt = sub.add_parser("adopt", help="preview or record existing manuscript chapters")
     adopt.add_argument("root"); adopt.add_argument("--apply", action="store_true"); adopt.add_argument("--confirm"); adopt.set_defaults(func=command_adopt)
+    chapter_repair = sub.add_parser("chapter-repair", help="reconcile legacy duplicate active records for one chapter")
+    chapter_repair.add_argument("root"); chapter_repair.add_argument("--chapter", type=int, required=True); chapter_repair.add_argument("--keep", required=True, help="event id whose verified正文 is保留"); chapter_repair.add_argument("--confirm", required=True); chapter_repair.set_defaults(func=command_chapter_repair)
     rebuild = sub.add_parser("rebuild", help="reduce the ledger into a snapshot")
     rebuild.add_argument("root"); rebuild.set_defaults(func=lambda args: rebuild_snapshot(require_project(Path(args.root))[0]))
     index = sub.add_parser("index", help="rebuild lexical and optional semantic retrieval")

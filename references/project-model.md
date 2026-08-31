@@ -42,6 +42,8 @@ This hashes and records existing chapters without moving or modifying them. It d
 
 A revised chapter appends a new `chapter` event with `predicate: revised` and `supersedes: <old-event-id>`. The reducer exposes only the current version in `snapshot.chapters` while retaining the append-only history in `snapshot.chapter_history`.
 
+迁移旧项目时若同一章已有多个并行接受记录，`chapter-repair` 会追加带 `resolves` 列表的 `reconciled` 事件，把明确选定且摘要匹配的正文收敛为唯一当前记录；所有旧事件仍保留在 `chapter_history` 中。
+
 For `fact`, stable `subject` and `predicate` values form an identity. A newer event supersedes an earlier value. To remove a fact, record value `__RETRACT__`.
 
 For structured continuity checks, use numeric `order` for events within the same chapter and stable predicates:

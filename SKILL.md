@@ -31,6 +31,7 @@ Use `scripts/story_workspace.py` for deterministic project state, indexing, cont
 7. Keep style optional. When `$style-writer` or a style pack is requested, use it as a prose constraint provider; never let stylistic retrieval override project canon.
 8. Keep plans and editorial opinions outside the canon ledger. A plan becomes a frozen session baseline, not an in-world fact.
 9. Revise an accepted chapter only through `revise-begin`, review, and `accept`; never edit an accepted file and manually rewrite its digest or chapter event.
+10. If a migrated project has duplicate active records for one chapter, resolve them with `chapter-repair` and an explicit event id before drafting or revising that chapter.
 
 For several-thousand-character chapters, prepare a compact context pack rather than loading the whole corpus. Draft from that pack, run `mechanical-review`, then perform a human-facing creative checkpoint covering character motive, causal clarity, payoff timing, prose quality, and intentional deviations. The legacy `review` command is only a compatibility alias and never implies semantic judgment.
 

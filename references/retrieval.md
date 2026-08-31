@@ -36,6 +36,8 @@ python scripts/story_workspace.py query <root> "谁拿走了银戒" --lexical-we
 
 Raise semantic weight for paraphrases and lexical weight for factual questions. Retrieved passages are evidence, not canon. Keep copyrighted source corpora and generated databases out of a public repository.
 
+中文连续文本默认按二字片段建立词法索引；查询单个汉字时会自动启用正文子串兜底，因此能够召回含该字的片段，但范围会比二字或多字查询更宽。该兜底也适用于已有索引，无需立刻重建。
+
 `query` reports `mode`, requested and effective weights, lexical backend, warnings, and hits. If vectors are absent or the Ollama query fails, it emits a warning and transfers semantic weight to lexical retrieval instead of silently reducing every score.
 
 If metadata claims a lexical backend whose table is missing, `query` reports an explicit fallback or `index-unavailable` warning. Re-run `index` instead of treating that empty result as evidence that the corpus has no answer.
