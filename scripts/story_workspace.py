@@ -25,6 +25,11 @@ STATE_DIR = ".storywork"
 EVENT_KINDS = {"fact", "setup", "payoff", "timeline", "decision", "chapter"}
 TEXT_SUFFIXES = {".txt", ".md", ".markdown"}
 SCENE_FUNCTIONS = {"setup", "escalation", "reversal", "payoff", "aftermath", "transition", "character"}
+CRITICAL_FACT_PREDICATES = {
+    "status", "identity", "age", "injury", "allegiance", "owner", "relationship",
+    "knows", "species", "ability", "limitation", "rule", "power_rule", "world_rule",
+    "身份", "状态", "年龄", "伤势", "阵营", "所有者", "关系", "知情", "能力", "限制", "规则", "世界规则",
+}
 
 
 class StoryError(RuntimeError):
@@ -174,7 +179,8 @@ def reduce_events(events: Sequence[dict]) -> dict:
     setups: dict[str, dict] = {}
     timeline: list[dict] = []
     decisions: list[dict] = []
-    chapters: list[dict] = []
+    chapter_slots: dict[int, list[dict]] = {}
+    chapter_history: list[dict] = []
     warnings: list[str] = []
     seen_ids: set[str] = set()
 
@@ -204,10 +210,19 @@ def reduce_events(events: Sequence[dict]) -> dict:
         elif kind == "decision":
             decisions.append(event)
         elif kind == "chapter":
-            chapters.append(event)
+            number = int(event.get("chapter") or 0)
+            chapter_history.append(event)
+            active = chapter_slots.setdefault(number, [])
+            supersedes = str(event.get("supersedes", ""))
+            matches = [index for index, item in enumerate(active) if str(item.get("id", "")) == supersedes]
+            if supersedes and len(matches) == 1:
+                active[matches[0]] = event
+            else:
+                active.append(event)
         else:
             warnings.append(f"未知事件类型：{kind}")
 
+    chapters = [item for active in chapter_slots.values() for item in active]
     chapters.sort(key=lambda item: (int(item.get("chapter") or 0), item.get("at", "")))
     return {
         "format": "serial-fiction-snapshot/v1",
@@ -218,6 +233,7 @@ def reduce_events(events: Sequence[dict]) -> dict:
         "timeline": timeline,
         "decisions": decisions,
         "chapters": chapters,
+        "chapter_history": chapter_history,
         "warnings": warnings,
     }
 
@@ -698,23 +714,80 @@ def snapshot_markdown(snapshot: dict) -> str:
     return "\n".join(lines)
 
 
-def compact_snapshot_markdown(snapshot: dict, max_chars: int = 24000) -> tuple[str, dict]:
+def item_position(item: dict) -> tuple[int, float]:
+    try:
+        order = float(item.get("order") or 0)
+    except (TypeError, ValueError):
+        order = 0.0
+    return int(item.get("chapter") or 0), order
+
+
+def select_memory_items(items: list[dict], limit: int, focus: str, critical_predicates: set[str] | None = None, oldest_first: bool = False) -> list[dict]:
+    ordered = sorted(items, key=item_position)
+    focus_tokens = set(search_terms(focus).split())
+
+    def critical(item: dict) -> bool:
+        return bool(item.get("pinned") or item.get("risk") == "high" or item.get("priority") == "locked" or (critical_predicates and str(item.get("predicate", "")) in critical_predicates))
+
+    def related(item: dict) -> bool:
+        if not focus_tokens:
+            return False
+        text = " ".join(str(item.get(key, "")) for key in ("subject", "predicate", "value"))
+        return bool(focus_tokens & set(search_terms(text).split()))
+
+    critical_items = [item for item in ordered if critical(item)]
+    balanced_critical: list[dict] = []
+    left, right = 0, len(critical_items) - 1
+    while left <= right:
+        balanced_critical.append(critical_items[left])
+        if left != right:
+            balanced_critical.append(critical_items[right])
+        left += 1
+        right -= 1
+    selected: list[dict] = []
+    seen: set[str] = set()
+    def add(group: Iterable[dict], count: int) -> None:
+        added = 0
+        for item in group:
+            identity = str(item.get("id") or id(item))
+            if identity in seen:
+                continue
+            selected.append(item)
+            seen.add(identity)
+            added += 1
+            if added >= count or len(selected) >= limit:
+                return
+
+    add(balanced_critical, max(1, limit // 2))
+    add((item for item in reversed(ordered) if related(item)), max(1, limit // 5))
+    add(ordered if oldest_first else ordered, max(1, limit // 8))
+    add(ordered if oldest_first else reversed(ordered), limit - len(selected))
+    if len(selected) < limit:
+        add(reversed(ordered) if oldest_first else ordered, limit - len(selected))
+    return selected
+
+
+def compact_snapshot_markdown(snapshot: dict, max_chars: int = 24000, focus: str = "") -> tuple[str, dict]:
     """Render a bounded working-memory view without changing the full snapshot on disk."""
-    facts = sorted(snapshot.get("facts", []), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
-    setups = sorted((item for item in snapshot.get("setups", []) if item.get("status") == "open"), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
-    decisions = sorted(snapshot.get("decisions", []), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
+    all_facts = list(snapshot.get("facts", []))
+    all_setups = [item for item in snapshot.get("setups", []) if item.get("status") == "open"]
+    all_decisions = list(snapshot.get("decisions", []))
+    facts = select_memory_items(all_facts, 240, focus, CRITICAL_FACT_PREDICATES)
+    setups = select_memory_items(all_setups, 160, focus, oldest_first=True)
+    decisions = select_memory_items(all_decisions, 80, focus)
     specs = [
-        ("facts", "## 已确认事实", facts, 240, 0.48, lambda item: f"- {item.get('subject')} / {item.get('predicate')}: {item.get('value')}（第{item.get('chapter', '?')}章）"),
-        ("setups", "## 未回收伏笔", setups, 160, 0.28, lambda item: f"- [{item.get('id')}] {item.get('subject')} / {item.get('predicate')}: {item.get('value')}"),
-        ("decisions", "## 创作决定", decisions, 80, 0.16, lambda item: f"- {item.get('predicate')}: {item.get('value')}"),
+        ("facts", "## 已确认事实", all_facts, facts, 0.48, lambda item: f"- {item.get('subject')} / {item.get('predicate')}: {item.get('value')}（第{item.get('chapter', '?')}章）", CRITICAL_FACT_PREDICATES),
+        ("setups", "## 未回收伏笔", all_setups, setups, 0.28, lambda item: f"- [{item.get('id')}] {item.get('subject')} / {item.get('predicate')}: {item.get('value')}", None),
+        ("decisions", "## 创作决定", all_decisions, decisions, 0.16, lambda item: f"- {item.get('predicate')}: {item.get('value')}", None),
     ]
     sections: list[str] = []
     report = {"max_characters": max_chars, "generated_characters": 0, "values_truncated": 0, "sections": {}}
-    for key, heading, items, item_limit, ratio, formatter in specs:
+    for key, heading, all_items, selected_items, ratio, formatter, critical_predicates in specs:
         budget = max(200, int(max_chars * ratio))
         lines = [heading]
         included = 0
-        for item in items[:item_limit]:
+        included_items: list[dict] = []
+        for item in selected_items:
             raw_line = formatter(item)
             line = raw_line if len(raw_line) <= 500 else raw_line[:497] + "…"
             if line != raw_line:
@@ -723,11 +796,20 @@ def compact_snapshot_markdown(snapshot: dict, max_chars: int = 24000) -> tuple[s
                 break
             lines.append(line)
             included += 1
-        report["sections"][key] = {"total": len(items), "included": included, "omitted": len(items) - included}
+            included_items.append(item)
+        included_ids = {str(item.get("id") or id(item)) for item in included_items}
+        omitted_items = [item for item in all_items if str(item.get("id") or id(item)) not in included_ids]
+        omitted_chapters = [int(item.get("chapter") or 0) for item in omitted_items if int(item.get("chapter") or 0) > 0]
+        omitted_critical = sum(bool(item.get("pinned") or item.get("risk") == "high" or item.get("priority") == "locked" or (critical_predicates and str(item.get("predicate", "")) in critical_predicates)) for item in omitted_items)
+        report["sections"][key] = {"total": len(all_items), "included": included, "omitted": len(omitted_items), "omitted_chapter_range": [min(omitted_chapters), max(omitted_chapters)] if omitted_chapters else None, "omitted_critical": omitted_critical}
         sections.append("\n".join(lines))
     omitted = sum(item["omitted"] for item in report["sections"].values())
     if omitted or report["values_truncated"]:
-        details = "；".join(f"{key} 省略 {item['omitted']} 条" for key, item in report["sections"].items() if item["omitted"])
+        details = "；".join(
+            f"{key} 省略 {item['omitted']} 条"
+            + (f"（章节范围 {item['omitted_chapter_range'][0]}–{item['omitted_chapter_range'][1]}" + (f"，其中关键项 {item['omitted_critical']} 条" if item["omitted_critical"] else "") + "）" if item["omitted_chapter_range"] else (f"（其中关键项 {item['omitted_critical']} 条）" if item["omitted_critical"] else ""))
+            for key, item in report["sections"].items() if item["omitted"]
+        )
         sections.append("## 上下文压缩说明\n- 本上下文只载入工作集，完整数据仍在 `.storywork/snapshot.json`。"
                         + (f"\n- {details}。需要时请定向查询或执行全量审计。" if details else "")
                         + (f"\n- {report['values_truncated']} 条超长值仅在本上下文中截短显示。" if report["values_truncated"] else ""))
@@ -775,7 +857,7 @@ def chapter_number(path: Path, text: str) -> int | None:
 def accepted_chapter_records(root: Path, chapter: int) -> list[dict]:
     return [
         event
-        for event in load_events(root)
+        for event in reduce_events(load_events(root)).get("chapters", [])
         if event.get("kind") == "chapter" and int(event.get("chapter") or 0) == chapter
     ]
 
@@ -784,7 +866,7 @@ def require_chapter_number_available(root: Path, chapter: int) -> None:
     existing = accepted_chapter_records(root, chapter)
     if existing:
         names = [str(event.get("subject", "")) for event in existing]
-        raise StoryError(f"第 {chapter} 章已有接受记录：{names}；请先使用明确的修订/迁移流程，不能创建第二份 canon")
+        raise StoryError(f"第 {chapter} 章已有接受记录：{names}；如需修改请使用 revise-begin，不能创建第二份 canon")
 
 
 def command_adopt(args: argparse.Namespace) -> dict:
@@ -792,7 +874,7 @@ def command_adopt(args: argparse.Namespace) -> dict:
     chapter_dir = resolve_manifest_path(root, manifest["chapters"])
     existing_by_number = {
         int(event.get("chapter") or 0): str(event.get("subject", ""))
-        for event in load_events(root)
+        for event in reduce_events(load_events(root)).get("chapters", [])
         if event.get("kind") == "chapter" and int(event.get("chapter") or 0) > 0
     }
     planned: list[dict] = []
@@ -837,6 +919,11 @@ def validate_proposed_event(item: dict, chapter: int) -> dict:
     evidence = str(item["evidence"]).strip()
     if len(evidence) > 300:
         raise StoryError("单条 evidence 不得超过 300 字符")
+    risk = str(item.get("risk", "normal"))
+    informative_evidence = re.sub(r"[^\w\u3400-\u9fff]+", "", evidence, flags=re.UNICODE).replace("_", "")
+    minimum_evidence = 10 if risk == "high" else 6
+    if len(informative_evidence) < minimum_evidence:
+        raise StoryError(f"evidence 有效字符不足；{risk} 事件至少需要 {minimum_evidence} 个文字或数字字符的连续引文")
     normalized = {
         "id": str(item.get("id") or uuid.uuid4().hex[:12]),
         "kind": kind,
@@ -847,7 +934,7 @@ def validate_proposed_event(item: dict, chapter: int) -> dict:
         "order": item.get("order"),
         "entity_type": item.get("entity_type"),
         "confidence": parse_float(item.get("confidence", 0.8), "事件 confidence"),
-        "risk": str(item.get("risk", "normal")),
+        "risk": risk,
         "evidence": evidence,
         "source": str(item.get("source", "chapter-extraction")),
     }
@@ -1272,7 +1359,26 @@ def command_pacing(args: argparse.Namespace) -> dict:
 
 def command_begin(args: argparse.Namespace) -> dict:
     root, manifest = require_project(Path(args.root))
-    require_chapter_number_available(root, int(args.chapter))
+    revision_mode = bool(getattr(args, "revision", False))
+    revision: dict | None = None
+    if revision_mode:
+        records = accepted_chapter_records(root, int(args.chapter))
+        if len(records) != 1:
+            raise StoryError(f"revise-begin 要求第 {args.chapter} 章恰好有一条当前接受记录，实际为 {len(records)} 条")
+        current = records[0]
+        chapter_dir = resolve_manifest_path(root, manifest["chapters"])
+        destination = chapter_dir / str(current.get("subject", ""))
+        if not destination.exists():
+            raise StoryError(f"待修订正文不存在：{destination}")
+        revision = {
+            "supersedes": str(current.get("id", "")),
+            "canonical_sha256": str(current.get("value", "")),
+            "observed_sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+            "destination": portable_path(root, destination),
+        }
+        revision["external_change_detected"] = revision["observed_sha256"] != revision["canonical_sha256"]
+    else:
+        require_chapter_number_available(root, int(args.chapter))
     snapshot_file = state_path(root) / "snapshot.json"
     snapshot = load_json(snapshot_file) if snapshot_file.exists() else rebuild_snapshot(root)
     session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -1287,12 +1393,14 @@ def command_begin(args: argparse.Namespace) -> dict:
     else:
         context_path = session_dir / "context.md"
     if context_path.exists():
-        raise StoryError(f"上下文输出文件已存在，拒绝覆盖：{context_path}")
-    memory_markdown, memory_report = compact_snapshot_markdown(snapshot)
+        raise StoryError(f"上下文输出文件已存在，拒绝覆盖：{context_path}；请省略 --out 使用会话专属文件，或改用按章节唯一的输出名")
+    memory_markdown, memory_report = compact_snapshot_markdown(snapshot, focus=args.query or effective_goal)
     plan_digest = plan_payload_digest(plan) if plan else None
-    session = {"format": "serial-fiction-session/v1", "id": session_id, "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "memory_context": memory_report, "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "retrieval": {key: retrieval[key] for key in ("mode", "lexical_backend", "requested_weights", "effective_weights", "warnings")}, "review": None}
+    session = {"format": "serial-fiction-session/v1", "id": session_id, "mode": "revision" if revision_mode else "new-chapter", "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "memory_context": memory_report, "revision": revision, "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "retrieval": {key: retrieval[key] for key in ("mode", "lexical_backend", "requested_weights", "effective_weights", "warnings")}, "review": None}
     write_json(session_dir / "session.json", session)
     sections = [f"# 第 {args.chapter} 章创作上下文", f"\n## 本章目标\n\n{effective_goal}", "\n" + memory_markdown]
+    if revision:
+        sections.append(f"\n## 修订基线\n\n当前文件：{revision['destination']}\n\ncanon 摘要：{revision['canonical_sha256']}\n\n开始修订时摘要：{revision['observed_sha256']}\n\n检测到工作流外修改：{revision['external_change_detected']}")
     if plan:
         sections.append("\n" + plan_markdown(plan))
     sections.append("\n## 最近正文")
@@ -1307,6 +1415,11 @@ def command_begin(args: argparse.Namespace) -> dict:
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_text(context, encoding="utf-8")
     return {"session": session_id, "context": str(context_path), "retrieved": len(results), "memory_context": memory_report, "retrieval": session["retrieval"]}
+
+
+def command_revise_begin(args: argparse.Namespace) -> dict:
+    args.revision = True
+    return command_begin(args)
 
 
 def repeated_lines(text: str) -> list[str]:
@@ -1360,7 +1473,13 @@ def command_accept(args: argparse.Namespace) -> dict:
         raise StoryError("确认值必须与 session id 完全一致")
     if session.get("status") != "reviewed" or not session.get("review"):
         raise StoryError("草稿必须先通过 review 流程")
-    require_chapter_number_available(root, int(session["chapter"]))
+    revision = session.get("revision") if session.get("mode") == "revision" else None
+    if revision:
+        current = accepted_chapter_records(root, int(session["chapter"]))
+        if len(current) != 1 or str(current[0].get("id", "")) != str(revision.get("supersedes", "")):
+            raise StoryError("修订会话绑定的当前章节版本已变化，请重新 revise-begin")
+    else:
+        require_chapter_number_available(root, int(session["chapter"]))
     blocking = [item for item in session["review"].get("findings", []) if item.get("severity") == "error"]
     if blocking:
         raise StoryError(f"审稿仍有 {len(blocking)} 个 error，不能接受章节")
@@ -1388,20 +1507,40 @@ def command_accept(args: argparse.Namespace) -> dict:
                 raise StoryError(f"计划偏差仍有 {len(blocking_deviations)} 个 error，不能接受章节")
     chapter_dir = resolve_manifest_path(root, manifest["chapters"])
     chapter_dir.mkdir(parents=True, exist_ok=True)
-    destination = chapter_dir / manifest.get("chapter_filename", "第{chapter:04d}章.md").format(chapter=int(session["chapter"]))
-    if destination.exists():
-        raise StoryError(f"目标章节已存在：{destination}")
+    if revision:
+        destination = resolve_manifest_path(root, str(revision["destination"])).resolve()
+        if not destination.exists():
+            raise StoryError(f"待修订正文不存在：{destination}")
+        observed_digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+        if observed_digest != revision.get("observed_sha256"):
+            raise StoryError("正文在 revise-begin 后再次变化，请重新开始修订")
+    else:
+        destination = chapter_dir / manifest.get("chapter_filename", "第{chapter:04d}章.md").format(chapter=int(session["chapter"]))
+        if destination.exists():
+            raise StoryError(f"目标章节已存在：{destination}")
     transaction_path = state_path(root) / "transactions" / f"{args.session}.json"
     pending_path = destination.with_name(f".{destination.name}.{args.session}.pending")
-    journal = {"format": "serial-fiction-transaction/v1", "session": args.session, "status": "prepared", "draft": str(draft), "pending": str(pending_path), "destination": str(destination), "digest": digest, "chapter": int(session["chapter"]), "created_at": now_iso()}
+    event = {"id": f"chapter-{args.session}", "kind": "chapter", "subject": destination.name, "predicate": "revised" if revision else "accepted", "value": digest, "chapter": int(session["chapter"]), "source": f"session:{args.session}"}
+    backup_path: Path | None = None
+    if revision:
+        event["supersedes"] = str(revision["supersedes"])
+        event["previous_sha256"] = str(revision["observed_sha256"])
+        event["canonical_sha256"] = str(revision["canonical_sha256"])
+        backup_path = state_path(root) / "revisions" / f"chapter-{int(session['chapter']):06d}" / f"{args.session}-{revision['observed_sha256'][:12]}{destination.suffix}"
+    journal = {"format": "serial-fiction-transaction/v1", "session": args.session, "mode": "revision" if revision else "new-chapter", "status": "prepared", "draft": str(draft), "pending": str(pending_path), "destination": str(destination), "backup": str(backup_path) if backup_path else None, "digest": digest, "chapter": int(session["chapter"]), "chapter_event": event, "created_at": now_iso()}
     write_json(transaction_path, journal)
     shutil.copy2(draft, pending_path)
     if hashlib.sha256(pending_path.read_bytes()).hexdigest() != digest:
         raise StoryError("章节临时副本校验失败")
+    if backup_path:
+        backup_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(destination, backup_path)
+        if hashlib.sha256(backup_path.read_bytes()).hexdigest() != revision["observed_sha256"]:
+            raise StoryError("修订前正文备份校验失败")
     os.replace(pending_path, destination)
     journal["status"] = "manuscript-written"
     write_json(transaction_path, journal)
-    event = append_event(root, {"id": f"chapter-{args.session}", "kind": "chapter", "subject": destination.name, "predicate": "accepted", "value": digest, "chapter": int(session["chapter"]), "source": f"session:{args.session}"})
+    event = append_event(root, event)
     journal["status"] = "ledger-written"
     write_json(transaction_path, journal)
     session["status"] = "accepted"
@@ -1430,11 +1569,14 @@ def recovery_actions(root: Path) -> list[dict]:
         destination = Path(journal["destination"])
         pending = Path(journal["pending"])
         expected = str(journal["digest"])
-        event_id = f"chapter-{journal['session']}"
+        chapter_event = journal.get("chapter_event") or {"id": f"chapter-{journal['session']}"}
+        event_id = str(chapter_event["id"])
         if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() == expected and event_id not in existing_ids:
             actions.append({"transaction": str(path), "action": "append-chapter-event"})
         elif not destination.exists() and pending.exists() and hashlib.sha256(pending.read_bytes()).hexdigest() == expected:
             actions.append({"transaction": str(path), "action": "finish-pending-copy"})
+        elif journal.get("mode") == "revision" and destination.exists() and pending.exists() and hashlib.sha256(pending.read_bytes()).hexdigest() == expected and hashlib.sha256(destination.read_bytes()).hexdigest() == chapter_event.get("previous_sha256"):
+            actions.append({"transaction": str(path), "action": "finish-pending-replace"})
         elif event_id in existing_ids:
             actions.append({"transaction": str(path), "action": "finalize-metadata"})
         else:
@@ -1457,13 +1599,20 @@ def command_recover(args: argparse.Namespace) -> dict:
         journal = load_json(journal_path)
         destination = Path(journal["destination"])
         pending = Path(journal["pending"])
-        if action["action"] == "finish-pending-copy":
+        if action["action"] in {"finish-pending-copy", "finish-pending-replace"}:
+            backup_value = journal.get("backup")
+            if action["action"] == "finish-pending-replace" and backup_value:
+                backup = Path(backup_value)
+                if not backup.exists():
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(destination, backup)
             destination.parent.mkdir(parents=True, exist_ok=True)
             os.replace(pending, destination)
         existing_ids = {str(event.get("id")) for event in load_events(root)}
-        event_id = f"chapter-{journal['session']}"
+        chapter_event = journal.get("chapter_event") or {"id": f"chapter-{journal['session']}", "kind": "chapter", "subject": destination.name, "predicate": "accepted", "value": journal["digest"], "chapter": int(journal["chapter"]), "source": f"session:{journal['session']}"}
+        event_id = str(chapter_event["id"])
         if event_id not in existing_ids:
-            append_event(root, {"id": event_id, "kind": "chapter", "subject": destination.name, "predicate": "accepted", "value": journal["digest"], "chapter": int(journal["chapter"]), "source": f"session:{journal['session']}"})
+            append_event(root, chapter_event)
         session_path = state_path(root) / "sessions" / journal["session"] / "session.json"
         session = load_json(session_path)
         session["status"] = "accepted"
@@ -1588,12 +1737,17 @@ def command_audit_pack(args: argparse.Namespace) -> dict:
     audit_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
     audit_dir = state_path(root) / "audits" / audit_id
     snapshot = load_json(state_path(root) / "snapshot.json")
+    memory_text, memory_report = compact_snapshot_markdown(snapshot, max_chars=24000)
+    memory_path = audit_dir / "memory.md"
+    memory_path.parent.mkdir(parents=True, exist_ok=True)
+    memory_path.write_text("# 语义审计共享记忆\n\n" + memory_text.strip() + "\n", encoding="utf-8")
+    memory_digest = hashlib.sha256(memory_path.read_bytes()).hexdigest()
     batches: list[dict] = []
     for start in range(0, len(chapters), args.batch_size):
         group = chapters[start : start + args.batch_size]
         batch_no = len(batches) + 1
         path = audit_dir / f"batch-{batch_no:03d}.md"
-        sections = [f"# 语义审计批次 {batch_no}", "\n" + snapshot_markdown(snapshot), "\n## 正文"]
+        sections = [f"# 语义审计批次 {batch_no}", f"\n## 共享记忆\n\n审阅本批前必须同时读取同目录的 `memory.md`（SHA-256: `{memory_digest}`）。该文件是有界工作集；需要核查被省略内容时回到完整 snapshot 或定向检索。", "\n## 正文"]
         hashes: list[dict] = []
         for number, chapter_path in group:
             text = read_text(chapter_path)
@@ -1602,9 +1756,9 @@ def command_audit_pack(args: argparse.Namespace) -> dict:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("\n".join(sections).strip() + "\n", encoding="utf-8")
         batches.append({"batch": batch_no, "path": str(path), "chapters": hashes, "status": "pending"})
-    audit = {"format": "serial-fiction-semantic-audit/v1", "id": audit_id, "scope": args.scope, "created_at": now_iso(), "status": "pending", "batches": batches}
+    audit = {"format": "serial-fiction-semantic-audit/v1", "id": audit_id, "scope": args.scope, "created_at": now_iso(), "status": "pending", "memory": {"path": portable_path(root, memory_path), "sha256": memory_digest, "report": memory_report}, "batches": batches}
     write_json(audit_dir / "manifest.json", audit)
-    return {"audit": audit_id, "scope": args.scope, "chapters": len(chapters), "batches": len(batches), "directory": str(audit_dir)}
+    return {"audit": audit_id, "scope": args.scope, "chapters": len(chapters), "batches": len(batches), "directory": str(audit_dir), "memory": str(memory_path), "memory_sha256": memory_digest}
 
 
 def validate_audit_finding(item: dict, allowed_chapters: set[int]) -> dict:
@@ -1631,6 +1785,10 @@ def command_audit_submit(args: argparse.Namespace) -> dict:
     audit_dir = state_path(root) / "audits" / args.audit
     manifest_path = audit_dir / "manifest.json"
     audit = load_json(manifest_path)
+    memory = audit.get("memory", {})
+    memory_path = resolve_manifest_path(root, str(memory.get("path", "")))
+    if not memory_path.exists() or hashlib.sha256(memory_path.read_bytes()).hexdigest() != memory.get("sha256"):
+        raise StoryError("审计共享记忆缺失或摘要不匹配，请重新生成 audit-pack")
     batch = next((item for item in audit.get("batches", []) if int(item["batch"]) == args.batch), None)
     if batch is None:
         raise StoryError("审计批次不存在")
@@ -1677,7 +1835,7 @@ def backup_members(root: Path, manifest: dict, include_context: bool) -> list[tu
         path = meta / name
         if path.exists():
             members.append((path, f"storywork/{name}"))
-    for folder in ("sessions", "audits", "transactions", "plans", "outcomes", "deviations"):
+    for folder in ("sessions", "audits", "transactions", "plans", "outcomes", "deviations", "revisions"):
         base = meta / folder
         if not base.exists():
             continue
@@ -1745,6 +1903,8 @@ def parser() -> argparse.ArgumentParser:
     query.add_argument("root"); query.add_argument("query"); query.add_argument("--limit", type=int, default=8); query.add_argument("--lexical-weight", type=float, default=0.65); query.add_argument("--semantic-weight", type=float, default=0.35); query.set_defaults(func=command_query)
     begin = sub.add_parser("begin", help="create a draft session and context pack")
     begin.add_argument("root"); begin.add_argument("--chapter", type=int, required=True); begin.add_argument("--goal", required=True); begin.add_argument("--query"); begin.add_argument("--limit", type=int, default=8); begin.add_argument("--out"); begin.set_defaults(func=command_begin)
+    revise_begin = sub.add_parser("revise-begin", help="create a guarded revision session for an accepted chapter")
+    revise_begin.add_argument("root"); revise_begin.add_argument("--chapter", type=int, required=True); revise_begin.add_argument("--goal", required=True); revise_begin.add_argument("--query"); revise_begin.add_argument("--limit", type=int, default=8); revise_begin.add_argument("--out"); revise_begin.set_defaults(func=command_revise_begin)
     mechanical_review = sub.add_parser("mechanical-review", help="run deterministic mechanical checks on a draft")
     mechanical_review.add_argument("root"); mechanical_review.add_argument("--session", required=True); mechanical_review.add_argument("--draft", required=True); mechanical_review.set_defaults(func=command_review)
     review = sub.add_parser("review", help="compatibility alias for mechanical-review")
@@ -1789,9 +1949,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except StoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        return 2
-    except (TypeError, ValueError, KeyError) as exc:
-        print(f"error: 输入数据无效：{exc}", file=sys.stderr)
         return 2
 
 

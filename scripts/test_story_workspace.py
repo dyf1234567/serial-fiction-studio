@@ -190,10 +190,12 @@ class StoryWorkspaceTests(unittest.TestCase):
         legacy_review = cli.parse_args(["review", str(self.root), "--session", "s", "--draft", "d.md"])
         backup = cli.parse_args(["backup", str(self.root), "--archive", "backup.sfs.zip"])
         verify = cli.parse_args(["verify-backup", "--archive", "backup.sfs.zip"])
+        revise = cli.parse_args(["revise-begin", str(self.root), "--chapter", "1", "--goal", "修订"])
         self.assertIs(mechanical.func, story.command_review)
         self.assertIs(legacy_review.func, story.command_review)
         self.assertEqual(backup.archive, "backup.sfs.zip")
         self.assertEqual(verify.archive, "backup.sfs.zip")
+        self.assertIs(revise.func, story.command_revise_begin)
 
     def test_adopt_previews_then_records_existing_chapters(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
@@ -228,6 +230,43 @@ class StoryWorkspaceTests(unittest.TestCase):
             story.command_accept(Namespace(root=str(self.root), session=session["session"], draft=str(draft), confirm=session["session"]))
         self.assertFalse((self.chapters / "第0004章.md").exists())
 
+    def test_revise_begin_reconciles_an_edited_accepted_chapter_and_restores_evidence_flow(self):
+        story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        original = story.command_begin(Namespace(root=str(self.root), chapter=5, goal="写第五章", query="第五章", limit=2, out=None))
+        draft = self.root / "chapter-5-draft.md"
+        draft.write_text("沈星仍在旧港等待。" * 100, encoding="utf-8")
+        story.command_review(Namespace(root=str(self.root), session=original["session"], draft=str(draft)))
+        accepted = story.command_accept(Namespace(root=str(self.root), session=original["session"], draft=str(draft), confirm=original["session"]))
+        chapter = Path(accepted["chapter"])
+        chapter.write_text(chapter.read_text(encoding="utf-8") + "\n沈星在修订后去了北塔。", encoding="utf-8")
+        before = story.command_audit(Namespace(root=str(self.root), setup_age=30))
+        self.assertTrue(any("记录后被修改" in item["message"] for item in before["findings"]))
+
+        revision = story.command_revise_begin(Namespace(root=str(self.root), chapter=5, goal="收编修订", query="北塔", limit=2, out=None))
+        revision_session = story.load_json(self.root / ".storywork" / "sessions" / revision["session"] / "session.json")
+        self.assertTrue(revision_session["revision"]["external_change_detected"])
+        story.command_review(Namespace(root=str(self.root), session=revision["session"], draft=str(chapter)))
+        revised = story.command_accept(Namespace(root=str(self.root), session=revision["session"], draft=str(chapter), confirm=revision["session"]))
+        self.assertEqual(Path(revised["chapter"]), chapter)
+        snapshot = story.load_json(self.root / ".storywork" / "snapshot.json")
+        self.assertEqual(len(snapshot["chapters"]), 1)
+        self.assertEqual(len(snapshot["chapter_history"]), 2)
+        self.assertEqual(snapshot["chapters"][0]["predicate"], "revised")
+        backups = list((self.root / ".storywork" / "revisions" / "chapter-000005").glob("*.md"))
+        self.assertEqual(len(backups), 1)
+        archive = self.root / "revision-backup.sfs.zip"
+        story.command_backup(Namespace(root=str(self.root), out=str(archive), include_context=False))
+        with story.zipfile.ZipFile(archive, "r") as handle:
+            self.assertTrue(any(name.startswith("storywork/revisions/chapter-000005/") for name in handle.namelist()))
+
+        events_path = self.root / "revised-events.json"
+        events_path.write_text(json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "location", "value": "北塔", "chapter": 5, "evidence": "沈星在修订后去了北塔。"}], ensure_ascii=False), encoding="utf-8")
+        story.command_stage_events(Namespace(root=str(self.root), session=revision["session"], events=str(events_path)))
+        story.command_approve_events(Namespace(root=str(self.root), session=revision["session"], confirm=revision["session"]))
+        self.assertEqual(story.load_json(self.root / ".storywork" / "snapshot.json")["facts"][0]["value"], "北塔")
+        after = story.command_audit(Namespace(root=str(self.root), setup_age=30))
+        self.assertFalse(any("记录后被修改" in item["message"] for item in after["findings"]))
+
     def test_accept_requires_review_and_exact_confirmation(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
         (self.chapters / "第0001章.md").write_text("前情。", encoding="utf-8")
@@ -261,6 +300,10 @@ class StoryWorkspaceTests(unittest.TestCase):
         story.command_review(Namespace(root=str(self.root), session=session["session"], draft=str(draft)))
         story.command_accept(Namespace(root=str(self.root), session=session["session"], draft=str(draft), confirm=session["session"]))
         events_path = self.root / "events.json"
+        for weak_evidence in ("。", "赤铜"):
+            events_path.write_text(json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "status", "value": "dead", "evidence": weak_evidence, "confidence": 0.99, "risk": "high"}], ensure_ascii=False), encoding="utf-8")
+            with self.assertRaisesRegex(story.StoryError, "evidence 有效字符不足"):
+                story.command_stage_events(Namespace(root=str(self.root), session=session["session"], events=str(events_path)))
         events_path.write_text(json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "status", "value": "dead", "evidence": "沈星明确说过自己永远不会死。", "confidence": 0.99, "risk": "high"}], ensure_ascii=False), encoding="utf-8")
         with self.assertRaisesRegex(story.StoryError, "不是已接受正文"):
             story.command_stage_events(Namespace(root=str(self.root), session=session["session"], events=str(events_path)))
@@ -323,6 +366,20 @@ class StoryWorkspaceTests(unittest.TestCase):
             self.assertTrue(stderr.startswith("error: "), stderr)
             self.assertNotIn("Traceback", stderr)
 
+    def test_main_does_not_mislabel_internal_programming_errors_as_user_input(self):
+        original_parser = story.parser
+
+        class BrokenParser:
+            def parse_args(self, argv):
+                return Namespace(func=lambda args: {}["internal-bug"])
+
+        story.parser = lambda: BrokenParser()
+        try:
+            with self.assertRaises(KeyError):
+                story.main([])
+        finally:
+            story.parser = original_parser
+
     def test_begin_out_is_project_relative_and_never_overwrites(self):
         story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
         elsewhere = Path(self.temp.name) / "elsewhere"
@@ -352,14 +409,19 @@ class StoryWorkspaceTests(unittest.TestCase):
             "decisions": [{"predicate": f"决定{i}", "value": "继续遵守创作决定" * 10, "chapter": i} for i in range(50)],
             "chapters": [],
         }
+        snapshot["facts"][0].update({"subject": "世界", "predicate": "power_rule", "value": "灵脉每百年断一次", "chapter": 1})
+        snapshot["facts"][1].update({"subject": "主角", "predicate": "injury", "value": "左手残疾", "chapter": 1})
         story.write_json(self.root / ".storywork" / "snapshot.json", snapshot)
         story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
         result = story.command_begin(Namespace(root=str(self.root), chapter=1, goal="开始", query="开始", limit=2, out=None))
         context = Path(result["context"]).read_text(encoding="utf-8")
         self.assertLess(len(context), 26000)
         self.assertIn("上下文压缩说明", context)
+        self.assertIn("灵脉每百年断一次", context)
+        self.assertIn("左手残疾", context)
         self.assertGreater(result["memory_context"]["sections"]["facts"]["omitted"], 0)
         self.assertGreater(result["memory_context"]["sections"]["setups"]["omitted"], 0)
+        self.assertIsNotNone(result["memory_context"]["sections"]["facts"]["omitted_chapter_range"])
         self.assertEqual(len(story.load_json(self.root / ".storywork" / "snapshot.json")["facts"]), 2000)
 
     def test_structured_audit_and_semantic_audit_batches(self):
@@ -377,6 +439,26 @@ class StoryWorkspaceTests(unittest.TestCase):
             story.command_audit_submit(Namespace(root=str(self.root), audit=pack["audit"], batch=batch, findings=str(findings_path)))
         finalized = story.command_audit_finalize(Namespace(root=str(self.root), audit=pack["audit"]))
         self.assertEqual(finalized["counts"]["risk"], 2)
+
+    def test_audit_pack_writes_one_bounded_shared_memory_instead_of_copying_snapshot(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        for chapter in range(1, 41):
+            (self.chapters / f"第{chapter:04d}章.md").write_text(f"# 第{chapter}章\n\n这一章的短正文。", encoding="utf-8")
+        snapshot = story.load_json(self.root / ".storywork" / "snapshot.json")
+        snapshot["facts"] = [{"id": f"fact-{i}", "subject": f"人物{i}", "predicate": "状态", "value": "持续有效的事实" * 12, "chapter": i} for i in range(1, 1203)]
+        story.write_json(self.root / ".storywork" / "snapshot.json", snapshot)
+        pack = story.command_audit_pack(Namespace(root=str(self.root), scope="volume", from_chapter=1, to_chapter=40, batch_size=4))
+        memory_path = Path(pack["memory"])
+        self.assertLessEqual(len(memory_path.read_text(encoding="utf-8")), 25000)
+        batches = sorted((Path(pack["directory"])).glob("batch-*.md"))
+        self.assertEqual(len(batches), 10)
+        for path in batches:
+            text = path.read_text(encoding="utf-8")
+            self.assertIn("memory.md", text)
+            self.assertNotIn("## 已确认事实", text)
+            self.assertLess(len(text), 3000)
+        manifest = story.load_json(Path(pack["directory"]) / "manifest.json")
+        self.assertEqual(manifest["memory"]["sha256"], pack["memory_sha256"])
 
     def test_audit_reports_missing_and_orphan_manuscript_files(self):
         self.chapters.mkdir(parents=True, exist_ok=True)

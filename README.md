@@ -15,6 +15,7 @@ Skill 自身负责确定性工作：项目状态、事实账本、词法与向�
 - 使用 FTS5、普通词法扫描和可选 embedding 检索
 - 生成紧凑写作上下文，避免每次加载整本小说
 - 通过 `begin → mechanical-review → accept` 管理草稿事务
+- 通过 `revise-begin → mechanical-review → accept` 安全修订已接受章节并保留旧版本
 - 经人工批准后提取章节事实、时间线与伏笔变化
 - 管理轻量章纲、场景结果、节奏和计划偏差
 - 执行章节、分卷与全书审计
@@ -96,6 +97,22 @@ python scripts/story_workspace.py mechanical-review <小说目录> `
 `mechanical-review` 只检查篇幅、禁用短语、冻结计划是否被修改、计划约束和重复句，不包含人物、因果、连续性或文风的语义判断。旧命令 `review` 仍作为兼容别名保留。
 
 需要语义审稿时，应由宿主模型阅读草稿；用户明确要求多 Agent 时，可加载连续性、人物与因果、结构与节奏、文风和重大剧情红队等只读角色。
+
+分卷审计的 `audit-pack` 会生成一份有界的共享 `memory.md`，各批次不再重复嵌入全量快照。审阅每批前需同时读取该文件并核对批次中记录的 SHA-256；若压缩报告提示遗漏关键项，应使用定向检索或完整 snapshot 补查。
+
+## 修订已接受章节
+
+不要直接覆盖已接受正文后继续使用旧 session。使用显式修订事务：
+
+```powershell
+python scripts/story_workspace.py revise-begin <小说目录> --chapter 18 --goal "修正时间错误并保留既有结局"
+python scripts/story_workspace.py mechanical-review <小说目录> --session <修订会话> --draft <修订稿>
+python scripts/story_workspace.py accept <小说目录> --session <修订会话> --draft <修订稿> --confirm <修订会话>
+```
+
+修订前版本会保存到 `.storywork/revisions/`，新章节记录通过 `supersedes` 替代旧版本，不会形成两个当前 canon。修订接受后，需要重新提取并人工批准受影响的事实。
+
+事实 evidence 必须是正文中的连续引文：普通事件至少包含 6 个有效文字或数字，高风险事件至少 10 个；纯标点和极短词不能通过。
 
 ## 可选文风集成
 

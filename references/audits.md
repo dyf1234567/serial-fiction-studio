@@ -20,4 +20,6 @@ python scripts/story_workspace.py audit-finalize <root> --audit <audit-id>
 
 Read every generated batch completely. Submit findings in JSON objects with `category`, `severity`, `chapter`, `evidence`, and `message`. Categories are `canon`, `chronology`, `character`, `setup`, `structure`, and `prose`. Cross-batch problems belong in the later batch and should list `related_chapters`.
 
+`audit-pack` writes one bounded `memory.md` beside the batches instead of copying the full snapshot into every batch. Every reviewer must read that shared file once and verify the SHA-256 printed in each batch before reviewing. The memory report identifies omitted counts, chapter ranges, and omitted critical items; use targeted retrieval or the full snapshot when an omitted area matters.
+
 Classify findings as `error`, `risk`, or `intentional`. Never automatically rewrite an intentional ambiguity. A volume audit should end with locked facts, carried setups, arc positions, and next-volume constraints.

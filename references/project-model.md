@@ -10,7 +10,8 @@ novel-root/
     |-- ledger.jsonl             append-only canon and decision events
     |-- snapshot.json            current reduced state
     |-- library.sqlite3          rebuildable lexical/vector index
-    `-- sessions/                draft transactions and review reports
+    |-- sessions/                draft transactions and review reports
+    `-- revisions/               preserved pre-revision chapter files
 ```
 
 Create metadata inside an existing novel without moving its text:
@@ -38,6 +39,8 @@ This hashes and records existing chapters without moving or modifying them. It d
 - `timeline`: a dated or ordered occurrence.
 - `decision`: an authorial constraint that should not be mistaken for in-world canon.
 - `chapter`: normally written by `accept`, recording the committed file and digest.
+
+A revised chapter appends a new `chapter` event with `predicate: revised` and `supersedes: <old-event-id>`. The reducer exposes only the current version in `snapshot.chapters` while retaining the append-only history in `snapshot.chapter_history`.
 
 For `fact`, stable `subject` and `predicate` values form an identity. A newer event supersedes an earlier value. To remove a fact, record value `__RETRACT__`.
 

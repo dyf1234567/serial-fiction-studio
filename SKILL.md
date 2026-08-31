@@ -30,6 +30,7 @@ Use `scripts/story_workspace.py` for deterministic project state, indexing, cont
 6. Preserve the user's ending, constraints, and intentional ambiguity. Flag contradictions instead of repairing them invisibly.
 7. Keep style optional. When `$style-writer` or a style pack is requested, use it as a prose constraint provider; never let stylistic retrieval override project canon.
 8. Keep plans and editorial opinions outside the canon ledger. A plan becomes a frozen session baseline, not an in-world fact.
+9. Revise an accepted chapter only through `revise-begin`, review, and `accept`; never edit an accepted file and manually rewrite its digest or chapter event.
 
 For several-thousand-character chapters, prepare a compact context pack rather than loading the whole corpus. Draft from that pack, run `mechanical-review`, then perform a human-facing creative checkpoint covering character motive, causal clarity, payoff timing, prose quality, and intentional deviations. The legacy `review` command is only a compatibility alias and never implies semantic judgment.
 
@@ -37,6 +38,6 @@ At a volume boundary, run an audit before starting the next volume. For high-imp
 
 If vector embeddings are unavailable, report the downgrade and transfer the requested semantic weight to lexical retrieval. Prefer SQLite FTS5; if the Python SQLite build lacks FTS5, use the built-in lexical scan fallback. Never fail the writing workflow solely because an embedding service or FTS5 is absent.
 
-After every accepted chapter, extract candidate events with quoted evidence, stage them, and ask the user to approve them before updating canon. At volume boundaries, complete every semantic audit batch and present the consolidated human checkpoint before continuing.
+After every accepted or revised chapter, extract candidate events with sufficiently informative quoted evidence, stage them, and ask the user to approve them before updating canon. At volume boundaries, read the audit's shared `memory.md`, complete every semantic audit batch, and present the consolidated human checkpoint before continuing.
 
 Use multiple agents only when the user requests them and collaboration is available. The root agent remains the sole writer and state mutator; reviewer agents return evidence-backed notes without editing files.
