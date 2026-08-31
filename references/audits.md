@@ -10,7 +10,7 @@ python scripts/story_workspace.py audit <root>
 
 This deterministic pass checks hashes, ledger integrity, missing accepted manuscript files, orphan chapter files not recorded in the ledger, old open setups, decreasing ages, conflicting same-moment locations or owners, and events recorded after a character's death.
 
-如果迁移旧项目后发现同一章有多个当前接受记录，先运行 `audit` 获取事件 id，再明确选择已核验的正文记录进行收敛：
+如果迁移旧项目后发现同一章有多个当前接受记录，先用 `audit` 确认冲突的正文文件名，再到 `.storywork/snapshot.json` 的 `chapters[]` 中按 `subject` 找到要保留那条的 `id`（快照可能过期时先执行 `rebuild`），然后明确收敛：
 
 ```powershell
 python scripts/story_workspace.py chapter-repair <root> --chapter 3 --keep <event-id> --confirm REPAIR-3
