@@ -19,7 +19,7 @@ Write a JSON array. Each event requires:
 }
 ```
 
-Use `risk: high` for death, resurrection, identity revelation, power-system changes, irreversible relationship changes, or facts that alter the planned ending. Evidence must be a short excerpt from the accepted chapter, no more than 300 characters.
+Use `risk: high` for death, resurrection, identity revelation, power-system changes, irreversible relationship changes, or facts that alter the planned ending. Evidence must be a continuous short excerpt from the accepted chapter, no more than 300 characters. `stage-events` and `approve-events` both verify the excerpt after whitespace normalization and verify that the accepted chapter hash has not changed.
 
 Do not extract similes, hypothetical statements, lies, dreams, plans, negated claims, or facts known only inside a flashback as current state. Use `timeline` when the event matters but does not define current state. Use stable predicates such as `status`, `location`, `age`, `owner`, `allegiance`, `injury`, and `knows` when applicable.
 

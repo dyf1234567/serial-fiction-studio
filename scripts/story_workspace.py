@@ -44,6 +44,16 @@ def now_iso() -> str:
 
 def read_text(path: Path) -> str:
     data = path.read_bytes()
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16")
+    if len(data) >= 4:
+        pairs = max(1, len(data) // 2)
+        odd_nuls = data[1::2].count(0)
+        even_nuls = data[0::2].count(0)
+        if odd_nuls > pairs // 2:
+            return data.decode("utf-16-le")
+        if even_nuls > pairs // 2:
+            return data.decode("utf-16-be")
     for encoding in ("utf-8-sig", "utf-8", "gb18030"):
         try:
             return data.decode(encoding)
@@ -70,13 +80,38 @@ def write_json(path: Path, value: object) -> None:
         raise
 
 
-def load_json(path: Path) -> dict:
+def read_json_value(path: Path) -> object:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        return json.loads(read_text(path))
     except FileNotFoundError as exc:
         raise StoryError(f"缺少文件：{path}") from exc
+    except OSError as exc:
+        raise StoryError(f"无法读取文件：{path}: {exc}") from exc
+    except UnicodeError as exc:
+        raise StoryError(f"文本编码无效：{path}: {exc}") from exc
     except json.JSONDecodeError as exc:
         raise StoryError(f"JSON 无效：{path}: {exc}") from exc
+
+
+def load_json(path: Path) -> dict:
+    value = read_json_value(path)
+    if not isinstance(value, dict):
+        raise StoryError(f"JSON 顶层必须是 object：{path}")
+    return value
+
+
+def parse_int(value: object, label: str) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError) as exc:
+        raise StoryError(f"{label} 必须是整数") from exc
+
+
+def parse_float(value: object, label: str) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError) as exc:
+        raise StoryError(f"{label} 必须是数字") from exc
 
 
 def state_path(root: Path) -> Path:
@@ -394,7 +429,11 @@ def build_hnsw(root: Path, con: sqlite3.Connection, requested: str) -> str:
 def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: str, endpoint: str, ann: str = "auto") -> dict:
     root, manifest = require_project(root)
     chapters = resolve_manifest_path(root, manifest["chapters"])
-    sources = [chapters] + [Path(value) for value in source_args]
+    reference_sources = [resolve_manifest_path(root, value).resolve() for value in source_args]
+    missing_sources = [str(path) for path in reference_sources if not path.exists()]
+    if missing_sources:
+        raise StoryError(f"索引参考源不存在；保留现有索引不变：{missing_sources}")
+    sources = [chapters] + reference_sources
     database = db_path(root)
     database.parent.mkdir(parents=True, exist_ok=True)
     con = connect_db(root)
@@ -481,7 +520,10 @@ def build_index(root: Path, source_args: Sequence[str], embeddings: str, model: 
 def command_index(args: argparse.Namespace) -> dict:
     root, manifest = require_project(Path(args.root))
     previous = manifest.get("retrieval", {})
-    sources = args.source if args.source is not None else manifest.get("index_sources", [])
+    if args.source is not None:
+        sources = [portable_path(root, Path(value).resolve()) for value in args.source]
+    else:
+        sources = list(manifest.get("index_sources", []))
     embeddings = args.embeddings or previous.get("embeddings", "none")
     model = args.model or previous.get("model", "bge-m3")
     endpoint = args.endpoint or previous.get("endpoint", "http://127.0.0.1:11434")
@@ -509,10 +551,27 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
         }
     con = connect_db(root)
     meta = {row["key"]: row["value"] for row in con.execute("SELECT key,value FROM meta")}
-    lexical_backend = meta.get("lexical_backend") or ("fts5" if table_exists(con, "docs_fts") else "scan")
+    warnings: list[str] = []
+    claimed_backend = meta.get("lexical_backend") or ("fts5" if table_exists(con, "docs_fts") else "scan")
+    has_fts = table_exists(con, "docs_fts")
+    has_scan = table_exists(con, "docs_lexical")
+    if claimed_backend == "fts5" and has_fts:
+        lexical_backend = "fts5"
+    elif claimed_backend == "scan" and has_scan:
+        lexical_backend = "scan"
+    elif has_scan:
+        lexical_backend = "scan"
+        warnings.append(f"索引元数据声明 {claimed_backend}，但对应词法表不存在；已降级到扫描检索，请运行 index 重建索引")
+    elif has_fts:
+        lexical_backend = "fts5"
+        warnings.append(f"索引元数据声明 {claimed_backend}，但对应词法表不存在；已改用现存 FTS5 表，请运行 index 修复元数据")
+    else:
+        lexical_backend = "unavailable"
+        warnings.append(f"索引元数据声明 {claimed_backend}，但词法索引表不存在；词法检索不可用，请运行 index 重建索引")
+    lexical_available = lexical_backend in {"fts5", "scan"}
     candidates: dict[int, dict] = {}
     candidate_limit = max(limit * 6, 30)
-    if lexical_backend == "fts5" and table_exists(con, "docs_fts"):
+    if lexical_backend == "fts5":
         rows = con.execute(
             "SELECT d.*, bm25(docs_fts) AS rank FROM docs_fts JOIN docs d ON d.id=docs_fts.doc_id WHERE docs_fts MATCH ? ORDER BY rank LIMIT ?",
             (query_expression(query), candidate_limit),
@@ -520,7 +579,7 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
     else:
         query_tokens = set(search_terms(query).split())
         scored_rows: list[tuple[float, sqlite3.Row]] = []
-        lexical_table = "docs_lexical" if table_exists(con, "docs_lexical") else None
+        lexical_table = "docs_lexical" if lexical_backend == "scan" else None
         if lexical_table:
             for row in con.execute("SELECT d.*,l.terms FROM docs_lexical l JOIN docs d ON d.id=l.doc_id"):
                 terms = set(str(row["terms"]).split())
@@ -535,8 +594,7 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
         item["semantic"] = 0.0
         candidates[int(row["id"])] = item
 
-    warnings: list[str] = []
-    effective_lexical = lexical_weight
+    effective_lexical = lexical_weight if lexical_available else 0.0
     effective_semantic = semantic_weight
     semantic_active = False
     vector_count = int(con.execute("SELECT COUNT(*) FROM docs WHERE vector IS NOT NULL").fetchone()[0])
@@ -547,11 +605,20 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
         except StoryError as exc:
             warnings.append(f"语义查询不可用，已将语义权重转交词法检索：{exc}")
     elif semantic_weight > 0:
-        warnings.append("索引没有可用 embedding，已将语义权重转交词法检索；如需语义召回，请使用 index --embeddings ollama 重建索引")
+        transfer = "已将语义权重转交词法检索" if lexical_available else "且当前词法索引也不可用"
+        warnings.append(f"索引没有可用 embedding，{transfer}；如需语义召回，请使用 index --embeddings ollama 重建索引")
 
     if semantic_weight > 0 and not semantic_active:
-        effective_lexical += effective_semantic
+        if lexical_available:
+            effective_lexical += effective_semantic
+        else:
+            warnings.append("语义与词法检索均不可用；本次查询无法返回索引命中")
         effective_semantic = 0.0
+
+    if not lexical_available and semantic_active and effective_lexical > 0:
+        effective_semantic += effective_lexical
+        effective_lexical = 0.0
+        warnings.append("词法索引不可用，已将词法权重转交语义检索")
 
     if semantic_active:
         semantic_rows: list[tuple[sqlite3.Row, float]] = []
@@ -586,7 +653,7 @@ def search_index_report(root: Path, query: str, limit: int, lexical_weight: floa
     elif semantic_active:
         mode = "vector"
     else:
-        mode = "fts5" if lexical_backend == "fts5" else "lexical-scan"
+        mode = {"fts5": "fts5", "scan": "lexical-scan", "unavailable": "index-unavailable"}[lexical_backend]
     return {
         "mode": mode,
         "lexical_backend": lexical_backend,
@@ -631,6 +698,44 @@ def snapshot_markdown(snapshot: dict) -> str:
     return "\n".join(lines)
 
 
+def compact_snapshot_markdown(snapshot: dict, max_chars: int = 24000) -> tuple[str, dict]:
+    """Render a bounded working-memory view without changing the full snapshot on disk."""
+    facts = sorted(snapshot.get("facts", []), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
+    setups = sorted((item for item in snapshot.get("setups", []) if item.get("status") == "open"), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
+    decisions = sorted(snapshot.get("decisions", []), key=lambda item: (int(item.get("chapter") or 0), float(item.get("order") or 0)), reverse=True)
+    specs = [
+        ("facts", "## 已确认事实", facts, 240, 0.48, lambda item: f"- {item.get('subject')} / {item.get('predicate')}: {item.get('value')}（第{item.get('chapter', '?')}章）"),
+        ("setups", "## 未回收伏笔", setups, 160, 0.28, lambda item: f"- [{item.get('id')}] {item.get('subject')} / {item.get('predicate')}: {item.get('value')}"),
+        ("decisions", "## 创作决定", decisions, 80, 0.16, lambda item: f"- {item.get('predicate')}: {item.get('value')}"),
+    ]
+    sections: list[str] = []
+    report = {"max_characters": max_chars, "generated_characters": 0, "values_truncated": 0, "sections": {}}
+    for key, heading, items, item_limit, ratio, formatter in specs:
+        budget = max(200, int(max_chars * ratio))
+        lines = [heading]
+        included = 0
+        for item in items[:item_limit]:
+            raw_line = formatter(item)
+            line = raw_line if len(raw_line) <= 500 else raw_line[:497] + "…"
+            if line != raw_line:
+                report["values_truncated"] += 1
+            if len("\n".join(lines + [line])) > budget:
+                break
+            lines.append(line)
+            included += 1
+        report["sections"][key] = {"total": len(items), "included": included, "omitted": len(items) - included}
+        sections.append("\n".join(lines))
+    omitted = sum(item["omitted"] for item in report["sections"].values())
+    if omitted or report["values_truncated"]:
+        details = "；".join(f"{key} 省略 {item['omitted']} 条" for key, item in report["sections"].items() if item["omitted"])
+        sections.append("## 上下文压缩说明\n- 本上下文只载入工作集，完整数据仍在 `.storywork/snapshot.json`。"
+                        + (f"\n- {details}。需要时请定向查询或执行全量审计。" if details else "")
+                        + (f"\n- {report['values_truncated']} 条超长值仅在本上下文中截短显示。" if report["values_truncated"] else ""))
+    rendered = "\n\n".join(sections)
+    report["generated_characters"] = len(rendered)
+    return rendered, report
+
+
 def command_init(args: argparse.Namespace) -> dict:
     root = Path(args.root).resolve()
     meta = state_path(root)
@@ -667,13 +772,28 @@ def chapter_number(path: Path, text: str) -> int | None:
     return None
 
 
+def accepted_chapter_records(root: Path, chapter: int) -> list[dict]:
+    return [
+        event
+        for event in load_events(root)
+        if event.get("kind") == "chapter" and int(event.get("chapter") or 0) == chapter
+    ]
+
+
+def require_chapter_number_available(root: Path, chapter: int) -> None:
+    existing = accepted_chapter_records(root, chapter)
+    if existing:
+        names = [str(event.get("subject", "")) for event in existing]
+        raise StoryError(f"第 {chapter} 章已有接受记录：{names}；请先使用明确的修订/迁移流程，不能创建第二份 canon")
+
+
 def command_adopt(args: argparse.Namespace) -> dict:
     root, manifest = require_project(Path(args.root))
     chapter_dir = resolve_manifest_path(root, manifest["chapters"])
-    existing = {
-        (int(event.get("chapter") or 0), str(event.get("value", "")))
+    existing_by_number = {
+        int(event.get("chapter") or 0): str(event.get("subject", ""))
         for event in load_events(root)
-        if event.get("kind") == "chapter"
+        if event.get("kind") == "chapter" and int(event.get("chapter") or 0) > 0
     }
     planned: list[dict] = []
     skipped: list[dict] = []
@@ -689,8 +809,8 @@ def command_adopt(args: argparse.Namespace) -> dict:
             skipped.append({"path": str(path), "reason": f"章节号与 {seen_numbers[number]} 重复"})
             continue
         seen_numbers[number] = path.name
-        if (number, digest) in existing:
-            skipped.append({"path": str(path), "reason": "已有相同接受记录"})
+        if number in existing_by_number:
+            skipped.append({"path": str(path), "reason": f"第 {number} 章已有接受记录：{existing_by_number[number]}"})
             continue
         planned.append({"chapter": number, "path": str(path), "name": path.name, "sha256": digest})
 
@@ -723,10 +843,10 @@ def validate_proposed_event(item: dict, chapter: int) -> dict:
         "subject": str(item["subject"]).strip(),
         "predicate": str(item["predicate"]).strip(),
         "value": item["value"],
-        "chapter": int(item.get("chapter") or chapter),
+        "chapter": parse_int(item.get("chapter") or chapter, "事件 chapter"),
         "order": item.get("order"),
         "entity_type": item.get("entity_type"),
-        "confidence": float(item.get("confidence", 0.8)),
+        "confidence": parse_float(item.get("confidence", 0.8), "事件 confidence"),
         "risk": str(item.get("risk", "normal")),
         "evidence": evidence,
         "source": str(item.get("source", "chapter-extraction")),
@@ -738,22 +858,50 @@ def validate_proposed_event(item: dict, chapter: int) -> dict:
     return normalized
 
 
+def normalize_evidence_text(value: str) -> str:
+    return re.sub(r"\s+", "", value)
+
+
+def accepted_session_manuscript(root: Path, session: dict) -> tuple[Path, str, str]:
+    destination_value = str(session.get("destination", "")).strip()
+    if not destination_value:
+        raise StoryError("已接受会话缺少正文路径，不能校验证据")
+    destination = resolve_manifest_path(root, destination_value).resolve()
+    if not destination.exists():
+        raise StoryError(f"已接受正文不存在，不能校验证据：{destination}")
+    digest = hashlib.sha256(destination.read_bytes()).hexdigest()
+    expected = str(session.get("review", {}).get("sha256", ""))
+    if expected and digest != expected:
+        raise StoryError("已接受正文在审稿后发生变化，不能暂存或批准事实")
+    return destination, read_text(destination), digest
+
+
+def require_evidence_in_chapter(event: dict, chapter_text: str) -> None:
+    evidence = normalize_evidence_text(str(event.get("evidence", "")))
+    if not evidence or evidence not in normalize_evidence_text(chapter_text):
+        raise StoryError(f"事件 {event.get('id')} 的 evidence 不是已接受正文中的连续短引文")
+
+
 def command_stage_events(args: argparse.Namespace) -> dict:
     root, _ = require_project(Path(args.root))
     session_dir = state_path(root) / "sessions" / args.session
     session = load_json(session_dir / "session.json")
     if session.get("status") != "accepted":
         raise StoryError("只有已接受章节才能暂存事实提取结果")
-    raw = json.loads(Path(args.events).read_text(encoding="utf-8"))
+    _, chapter_text, chapter_digest = accepted_session_manuscript(root, session)
+    raw = read_json_value(Path(args.events))
     if not isinstance(raw, list):
         raise StoryError("事件文件顶层必须是数组")
     events = [validate_proposed_event(item, int(session["chapter"])) for item in raw]
+    for event in events:
+        require_evidence_in_chapter(event, chapter_text)
     proposal = {
         "format": "serial-fiction-event-proposal/v1",
         "session": args.session,
         "status": "pending",
         "created_at": now_iso(),
         "chapter": int(session["chapter"]),
+        "chapter_sha256": chapter_digest,
         "events": events,
     }
     write_json(session_dir / "event-proposal.json", proposal)
@@ -768,9 +916,20 @@ def command_approve_events(args: argparse.Namespace) -> dict:
         raise StoryError("确认值必须与 session id 完全一致")
     if proposal.get("status") == "approved":
         return {"session": args.session, "status": "already-approved", "applied": 0}
+    if proposal.get("session") != args.session:
+        raise StoryError("事实提案绑定的 session 不一致")
+    session = load_json(state_path(root) / "sessions" / args.session / "session.json")
+    if session.get("status") != "accepted":
+        raise StoryError("只有已接受章节的事实提案可以批准")
+    _, chapter_text, chapter_digest = accepted_session_manuscript(root, session)
+    if proposal.get("chapter_sha256") != chapter_digest:
+        raise StoryError("事实提案绑定的正文摘要已过期，请重新 stage-events")
+    validated_events = [validate_proposed_event(item, int(session["chapter"])) for item in proposal.get("events", [])]
+    for event in validated_events:
+        require_evidence_in_chapter(event, chapter_text)
     existing_ids = {str(event.get("id")) for event in load_events(root)}
     applied = 0
-    for event in proposal.get("events", []):
+    for event in validated_events:
         if str(event.get("id")) not in existing_ids:
             append_event(root, event)
             existing_ids.add(str(event.get("id")))
@@ -791,7 +950,9 @@ def outcome_path(root: Path, chapter: int) -> Path:
 
 
 def validate_plan(raw: dict, chapter: int) -> dict:
-    if not isinstance(raw, dict) or int(raw.get("chapter") or 0) != chapter:
+    if not isinstance(raw, dict):
+        raise StoryError("计划必须是 object，且 chapter 与命令参数一致")
+    if parse_int(raw.get("chapter") or 0, "计划 chapter") != chapter:
         raise StoryError("计划必须是 object，且 chapter 与命令参数一致")
     if not str(raw.get("goal", "")).strip():
         raise StoryError("计划缺少 goal")
@@ -801,6 +962,8 @@ def validate_plan(raw: dict, chapter: int) -> dict:
     scene_ids: set[str] = set()
     normalized_scenes: list[dict] = []
     for item in scenes:
+        if not isinstance(item, dict):
+            raise StoryError("每个计划场景必须是 object")
         scene_id = str(item.get("id", "")).strip()
         function = str(item.get("function", "")).strip()
         if not scene_id or scene_id in scene_ids:
@@ -810,8 +973,8 @@ def validate_plan(raw: dict, chapter: int) -> dict:
         for field in ("purpose", "pov", "location", "objective", "obstacle", "turn", "consequence"):
             if not str(item.get(field, "")).strip():
                 raise StoryError(f"场景 {scene_id} 缺少 {field}")
-        tension = int(item.get("tension") or 0)
-        information = int(item.get("information_gain") or 0)
+        tension = parse_int(item.get("tension") or 0, f"场景 {scene_id} tension")
+        information = parse_int(item.get("information_gain") or 0, f"场景 {scene_id} information_gain")
         if tension not in range(1, 6) or information not in range(0, 4):
             raise StoryError(f"场景 {scene_id} 的 tension 或 information_gain 超出范围")
         scene_ids.add(scene_id)
@@ -820,6 +983,8 @@ def validate_plan(raw: dict, chapter: int) -> dict:
     commitment_ids: set[str] = set()
     normalized_commitments: list[dict] = []
     for item in commitments:
+        if not isinstance(item, dict):
+            raise StoryError("每个 commitment 必须是 object")
         commitment_id = str(item.get("id", "")).strip()
         priority = str(item.get("priority", "should"))
         if not commitment_id or commitment_id in commitment_ids or priority not in {"must", "should"} or not str(item.get("description", "")).strip():
@@ -831,6 +996,8 @@ def validate_plan(raw: dict, chapter: int) -> dict:
     for index, item in enumerate(raw.get("constraints", []), 1):
         if isinstance(item, str):
             item = {"id": f"constraint-{index}", "description": item, "level": "hard"}
+        if not isinstance(item, dict):
+            raise StoryError("每个 constraint 必须是字符串或 object")
         constraint_id = str(item.get("id", "")).strip()
         level = str(item.get("level", "hard"))
         if not constraint_id or constraint_id in constraint_ids or level not in {"hard", "soft"} or not str(item.get("description", "")).strip():
@@ -838,7 +1005,7 @@ def validate_plan(raw: dict, chapter: int) -> dict:
         constraint_ids.add(constraint_id)
         normalized_constraints.append({"id": constraint_id, "description": str(item["description"]), "level": level, "forbidden_phrase": item.get("forbidden_phrase")})
     pacing = raw.get("pacing", {})
-    target = int(pacing.get("target_characters") or 0)
+    target = parse_int(pacing.get("target_characters") or 0, "target_characters")
     if target < 0:
         raise StoryError("target_characters 不能为负数")
     climax = pacing.get("climax_scene")
@@ -851,7 +1018,7 @@ def command_plan_set(args: argparse.Namespace) -> dict:
     root, _ = require_project(Path(args.root))
     if args.confirm != f"PLAN-{args.chapter}":
         raise StoryError(f"确认值必须是 PLAN-{args.chapter}")
-    raw = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    raw = read_json_value(Path(args.plan))
     normalized = validate_plan(raw, args.chapter)
     path = plan_path(root, args.chapter)
     history = load_json(path) if path.exists() else {"format": "serial-fiction-plan-history/v1", "chapter": args.chapter, "versions": []}
@@ -915,7 +1082,9 @@ def plan_content_digest(plan: dict) -> str:
 
 
 def validate_outcome(raw: dict, chapter: int, plan: dict | None) -> dict:
-    if not isinstance(raw, dict) or int(raw.get("chapter") or 0) != chapter:
+    if not isinstance(raw, dict):
+        raise StoryError("结果必须是 object，且 chapter 与会话一致")
+    if parse_int(raw.get("chapter") or 0, "结果 chapter") != chapter:
         raise StoryError("结果必须是 object，且 chapter 与会话一致")
     scenes = raw.get("scenes")
     if not isinstance(scenes, list) or not scenes:
@@ -931,6 +1100,8 @@ def validate_outcome(raw: dict, chapter: int, plan: dict | None) -> dict:
         raise StoryError(f"violated_constraints 引用未知 id：{sorted(set(violated) - constraint_ids)}")
     normalized: list[dict] = []
     for index, item in enumerate(scenes, 1):
+        if not isinstance(item, dict):
+            raise StoryError(f"实际场景 {index} 必须是 object")
         references = item.get("plan_scene_ids")
         if references is None:
             references = [item["plan_scene_id"]] if item.get("plan_scene_id") is not None else []
@@ -941,8 +1112,8 @@ def validate_outcome(raw: dict, chapter: int, plan: dict | None) -> dict:
         function = str(item.get("function", ""))
         if function not in SCENE_FUNCTIONS:
             raise StoryError(f"未知实际场景功能：{function}")
-        tension = int(item.get("tension") or 0)
-        information = int(item.get("information_gain") or 0)
+        tension = parse_int(item.get("tension") or 0, f"实际场景 {index} tension")
+        information = parse_int(item.get("information_gain") or 0, f"实际场景 {index} information_gain")
         if tension not in range(1, 6) or information not in range(0, 4):
             raise StoryError(f"实际场景 {index} 的节奏指标超出范围")
         if not str(item.get("summary", "")).strip():
@@ -951,7 +1122,7 @@ def validate_outcome(raw: dict, chapter: int, plan: dict | None) -> dict:
         if len(evidence) > 300:
             raise StoryError("场景 evidence 不得超过 300 字符")
         normalized.append({**item, "plan_scene_ids": references, "plan_scene_id": references[0] if len(references) == 1 else None, "function": function, "tension": tension, "information_gain": information, "irreversible": bool(item.get("irreversible", False)), "setup_actions": item.get("setup_actions", []), "evidence": evidence})
-    return {"chapter": chapter, "actual_characters": int(raw.get("actual_characters") or 0), "fulfilled_commitments": fulfilled, "violated_constraints": violated, "unplanned_changes": list(raw.get("unplanned_changes", [])), "intentional_deviations": list(raw.get("intentional_deviations", [])), "scenes": normalized, "notes": str(raw.get("notes", ""))}
+    return {"chapter": chapter, "actual_characters": parse_int(raw.get("actual_characters") or 0, "actual_characters"), "fulfilled_commitments": fulfilled, "violated_constraints": violated, "unplanned_changes": list(raw.get("unplanned_changes", [])), "intentional_deviations": list(raw.get("intentional_deviations", [])), "scenes": normalized, "notes": str(raw.get("notes", ""))}
 
 
 def command_outcome_set(args: argparse.Namespace) -> dict:
@@ -962,7 +1133,7 @@ def command_outcome_set(args: argparse.Namespace) -> dict:
     if args.confirm != args.session:
         raise StoryError("确认值必须与 session id 完全一致")
     chapter = int(session["chapter"])
-    raw = json.loads(Path(args.outcome).read_text(encoding="utf-8"))
+    raw = read_json_value(Path(args.outcome))
     frozen_plan = plan_version(root, chapter, session.get("plan_version"))
     normalized = validate_outcome(raw, chapter, frozen_plan)
     normalized["actual_characters"] = int(session.get("review", {}).get("characters") or normalized["actual_characters"])
@@ -1101,6 +1272,7 @@ def command_pacing(args: argparse.Namespace) -> dict:
 
 def command_begin(args: argparse.Namespace) -> dict:
     root, manifest = require_project(Path(args.root))
+    require_chapter_number_available(root, int(args.chapter))
     snapshot_file = state_path(root) / "snapshot.json"
     snapshot = load_json(snapshot_file) if snapshot_file.exists() else rebuild_snapshot(root)
     session_id = dt.datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6]
@@ -1109,10 +1281,18 @@ def command_begin(args: argparse.Namespace) -> dict:
     retrieval = search_index_report(root, args.query or effective_goal, args.limit, 0.65, 0.35)
     results = retrieval["hits"]
     session_dir = state_path(root) / "sessions" / session_id
+    if args.out:
+        requested_context = Path(args.out)
+        context_path = (requested_context if requested_context.is_absolute() else root / requested_context).resolve()
+    else:
+        context_path = session_dir / "context.md"
+    if context_path.exists():
+        raise StoryError(f"上下文输出文件已存在，拒绝覆盖：{context_path}")
+    memory_markdown, memory_report = compact_snapshot_markdown(snapshot)
     plan_digest = plan_payload_digest(plan) if plan else None
-    session = {"format": "serial-fiction-session/v1", "id": session_id, "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "retrieval": {key: retrieval[key] for key in ("mode", "lexical_backend", "requested_weights", "effective_weights", "warnings")}, "review": None}
+    session = {"format": "serial-fiction-session/v1", "id": session_id, "status": "prepared", "created_at": now_iso(), "chapter": args.chapter, "goal": effective_goal, "requested_goal": args.goal if plan and args.goal != effective_goal else None, "query": args.query or effective_goal, "snapshot_built_at": snapshot.get("built_at"), "memory_context": memory_report, "plan_version": plan.get("version") if plan else None, "plan_digest": plan_digest, "retrieval": {key: retrieval[key] for key in ("mode", "lexical_backend", "requested_weights", "effective_weights", "warnings")}, "review": None}
     write_json(session_dir / "session.json", session)
-    sections = [f"# 第 {args.chapter} 章创作上下文", f"\n## 本章目标\n\n{effective_goal}", "\n" + snapshot_markdown(snapshot)]
+    sections = [f"# 第 {args.chapter} 章创作上下文", f"\n## 本章目标\n\n{effective_goal}", "\n" + memory_markdown]
     if plan:
         sections.append("\n" + plan_markdown(plan))
     sections.append("\n## 最近正文")
@@ -1124,10 +1304,9 @@ def command_begin(args: argparse.Namespace) -> dict:
     for item in results:
         sections.append(f"\n### {item['title']} · {item['path']} · score={item['score']:.3f}\n\n{item['text']}")
     context = "\n".join(sections).strip() + "\n"
-    context_path = Path(args.out).resolve() if args.out else session_dir / "context.md"
     context_path.parent.mkdir(parents=True, exist_ok=True)
     context_path.write_text(context, encoding="utf-8")
-    return {"session": session_id, "context": str(context_path), "retrieved": len(results), "retrieval": session["retrieval"]}
+    return {"session": session_id, "context": str(context_path), "retrieved": len(results), "memory_context": memory_report, "retrieval": session["retrieval"]}
 
 
 def repeated_lines(text: str) -> list[str]:
@@ -1181,6 +1360,7 @@ def command_accept(args: argparse.Namespace) -> dict:
         raise StoryError("确认值必须与 session id 完全一致")
     if session.get("status") != "reviewed" or not session.get("review"):
         raise StoryError("草稿必须先通过 review 流程")
+    require_chapter_number_available(root, int(session["chapter"]))
     blocking = [item for item in session["review"].get("findings", []) if item.get("severity") == "error"]
     if blocking:
         raise StoryError(f"审稿仍有 {len(blocking)} 个 error，不能接受章节")
@@ -1371,11 +1551,17 @@ def command_audit(args: argparse.Namespace) -> dict:
     chapter_dir = resolve_manifest_path(root, manifest["chapters"])
     disk_files = list(iter_source_files([chapter_dir]))
     disk_by_name = {path.name: path for path in disk_files}
+    accepted_names = {str(item.get("subject", "")) for item in snapshot.get("chapters", [])}
     for item in snapshot.get("chapters", []):
         name = str(item.get("subject", ""))
         path = disk_by_name.get(name)
-        if path and hashlib.sha256(path.read_bytes()).hexdigest() != item.get("value"):
+        if path is None:
+            findings.append({"severity": "error", "category": "manuscript", "message": f"账本中的已接受正文文件已丢失：{name}"})
+        elif hashlib.sha256(path.read_bytes()).hexdigest() != item.get("value"):
             findings.append({"severity": "error", "category": "manuscript", "message": f"已接受章节在记录后被修改：{name}"})
+    for path in disk_files:
+        if path.name not in accepted_names and chapter_number(path, read_text(path)) is not None:
+            findings.append({"severity": "error", "category": "manuscript", "message": f"正文目录存在未写入账本的孤儿章节：{path.name}"})
     findings.extend(structured_findings(events))
     report = {"audited_at": now_iso(), "events": len(events), "accepted_chapters": len(snapshot.get("chapters", [])), "manuscript_files": len(disk_files), "open_setups": len(open_setups), "findings": findings, "editorial_review_required": True}
     write_json(state_path(root) / "audit.json", report)
@@ -1426,7 +1612,7 @@ def validate_audit_finding(item: dict, allowed_chapters: set[int]) -> dict:
         raise StoryError("审计 finding 必须是 object")
     category = str(item.get("category", ""))
     severity = str(item.get("severity", ""))
-    chapter = int(item.get("chapter") or 0)
+    chapter = parse_int(item.get("chapter") or 0, "finding chapter")
     evidence = str(item.get("evidence", "")).strip()
     message = str(item.get("message", "")).strip()
     if category not in {"canon", "chronology", "character", "setup", "structure", "prose"}:
@@ -1449,7 +1635,7 @@ def command_audit_submit(args: argparse.Namespace) -> dict:
     if batch is None:
         raise StoryError("审计批次不存在")
     allowed = {int(item["chapter"]) for item in batch["chapters"]}
-    raw = json.loads(Path(args.findings).read_text(encoding="utf-8"))
+    raw = read_json_value(Path(args.findings))
     if not isinstance(raw, list):
         raise StoryError("审计结果顶层必须是数组")
     findings = [validate_audit_finding(item, allowed) for item in raw]
@@ -1487,7 +1673,7 @@ def command_audit_finalize(args: argparse.Namespace) -> dict:
 def backup_members(root: Path, manifest: dict, include_context: bool) -> list[tuple[Path, str]]:
     members: list[tuple[Path, str]] = []
     meta = state_path(root)
-    for name in ("manifest.json", "ledger.jsonl", "snapshot.json", "audit.json"):
+    for name in ("manifest.json", "ledger.jsonl", "snapshot.json", "audit.json", "pacing.json"):
         path = meta / name
         if path.exists():
             members.append((path, f"storywork/{name}"))
@@ -1603,6 +1789,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     except StoryError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return 2
+    except (TypeError, ValueError, KeyError) as exc:
+        print(f"error: 输入数据无效：{exc}", file=sys.stderr)
         return 2
 
 

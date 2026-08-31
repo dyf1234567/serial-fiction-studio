@@ -22,6 +22,8 @@ Skill 自身负责确定性工作：项目状态、事实账本、词法与向�
 
 ## 安装
 
+### Codex
+
 ```powershell
 git clone https://github.com/dyf1234567/serial-fiction-studio.git "$env:USERPROFILE\.codex\skills\serial-fiction-studio"
 ```
@@ -32,6 +34,12 @@ git clone https://github.com/dyf1234567/serial-fiction-studio.git "$env:USERPROF
 $serial-fiction-studio 继续写当前小说下一章，保持人物、时间线和伏笔一致。
 ```
 
+`agents/openai.yaml` 是 Codex 用来展示 Skill 名称、简介和默认调用提示的界面元数据，不是可执行 Agent，也不需要用户单独运行。
+
+### Qoder
+
+把整个仓库复制到 Qoder 可读取的 Skill 目录；如果只需要多角色审稿，可将 `adapters/qoder/agents/` 中所需角色复制到小说项目的 `.qoder/agents/`（项目级）或 `~/.qoder/agents/`（用户级），然后执行 `/agents reload`。这些定义均为只读审稿角色，协调者仍是唯一写作者和状态修改者。
+
 ## 检索模式
 
 默认索引不调用 embedding：
@@ -39,6 +47,17 @@ $serial-fiction-studio 继续写当前小说下一章，保持人物、时间线
 ```powershell
 python scripts/story_workspace.py index <小说目录> --embeddings none
 ```
+
+需要同时索引设定集、旧稿或外部参考语料时，可重复使用 `--source`：
+
+```powershell
+python scripts/story_workspace.py index <小说目录> `
+  --source <设定集目录> `
+  --source <参考语料目录> `
+  --embeddings none
+```
+
+首次指定的来源会写入项目 manifest。相对路径在本次命令中按当前工作目录解析后保存为稳定路径；以后可省略 `--source`。若已保存的来源不存在，索引会报错并保留旧索引，不会静默清空。
 
 优先使用 SQLite FTS5。若当前 Python 的 SQLite 不包含 FTS5，Skill 会自动降级为普通词法扫描，并在结果中返回 `lexical_backend: scan`。
 
@@ -63,6 +82,8 @@ python scripts/story_workspace.py query <小说目录> "谁拿走了银戒" `
 ```
 
 查询结果会明确返回检索模式、请求权重、实际权重、降级警告和命中内容。如果没有向量或 Ollama 暂时离线，语义权重会自动转交给词法检索，不再静默失效。
+
+如果索引元数据与实际 SQLite 表不一致，查询会明确返回降级或 `index-unavailable`，并提示重新运行 `index`，不会把空结果伪报为正常 FTS5 查询。
 
 ## 审稿说明
 
@@ -102,9 +123,15 @@ python scripts/story_workspace.py verify-backup --archive <备份文件.sfs.zip>
 
 旧的 `backup --out` 和位置参数形式仍可使用。
 
+备份包含计划、实际结果、偏差报告和已生成的 `pacing.json`；SQLite/HNSW 检索索引仍属于可重建数据，不进入备份。
+
 ## 数据边界
 
 公开仓库不应包含小说正文、`.storywork/`、作者语料、SQLite/HNSW 索引、上下文包或个人备份。索引属于可重建数据；正文、manifest 和事件账本才是可移植事实来源。
+
+## 许可证
+
+本仓库中的 Skill 代码与随附文档使用 [MIT License](LICENSE)。该许可证不覆盖用户小说正文、第三方作者原文、风格语料、参考语料、生成的向量数据库或其他未包含在本仓库中的内容。
 
 ## 验证
 

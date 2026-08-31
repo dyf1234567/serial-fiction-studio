@@ -20,6 +20,6 @@ python scripts/story_workspace.py verify-backup --archive <backup.sfs.zip>
 
 Backups contain operational metadata, semantic audit results, transaction journals, and manuscript chapters. Rebuildable SQLite and HNSW indexes are excluded. Context packs are excluded unless `--include-context` is supplied because they may duplicate large or copyrighted reference excerpts.
 
-Versioned plans, accepted outcome histories, pacing data, and deviation reports are included because they are not rebuildable from the ledger alone.
+Versioned plans, accepted outcome histories, the latest generated `pacing.json`, and deviation reports are included. Pacing can also be regenerated from accepted outcome histories after recovery.
 
 Keep at least one verified backup outside the novel directory before a volume-wide rewrite. Verification checks every archived member against its recorded SHA-256 digest.

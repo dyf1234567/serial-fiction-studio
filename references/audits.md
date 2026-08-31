@@ -8,7 +8,7 @@
 python scripts/story_workspace.py audit <root>
 ```
 
-This deterministic pass checks hashes, ledger integrity, old open setups, decreasing ages, conflicting same-moment locations or owners, and events recorded after a character's death.
+This deterministic pass checks hashes, ledger integrity, missing accepted manuscript files, orphan chapter files not recorded in the ledger, old open setups, decreasing ages, conflicting same-moment locations or owners, and events recorded after a character's death.
 
 For a semantic volume or whole-book pass:
 

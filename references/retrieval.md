@@ -10,6 +10,14 @@ Optional semantic retrieval:
 python scripts/story_workspace.py index <root> --embeddings ollama --model bge-m3 --endpoint http://127.0.0.1:11434 --ann auto
 ```
 
+Index external reference sources by repeating `--source`:
+
+```powershell
+python scripts/story_workspace.py index <root> --source <world-bible> --source <reference-corpus> --embeddings none
+```
+
+An explicitly supplied relative source is resolved from the command's current working directory and persisted as a stable project-relative or absolute path. Later `index` calls reuse the saved sources. If a saved source is missing, indexing stops before changing the database, reports the missing path, and preserves the previous index.
+
 The script supports the Ollama `/api/embed` protocol. The endpoint defaults to local Ollama but may point to a remote Ollama server. It calls the endpoint only when `--embeddings ollama` is explicitly selected. Embeddings are rebuildable, not required for portability. For an RTX 4060 laptop with 8 GB VRAM, `bge-m3` is a practical multilingual default. If unavailable, use `--embeddings none`.
 
 `--ann auto` uses HNSW when the optional `hnswlib` and `numpy` packages are available, otherwise it uses exact cosine search. Use `--ann hnsw` to require HNSW and fail clearly if the dependency is missing. The HNSW file is derived data and should be rebuilt after migration.
@@ -29,3 +37,5 @@ python scripts/story_workspace.py query <root> "谁拿走了银戒" --lexical-we
 Raise semantic weight for paraphrases and lexical weight for factual questions. Retrieved passages are evidence, not canon. Keep copyrighted source corpora and generated databases out of a public repository.
 
 `query` reports `mode`, requested and effective weights, lexical backend, warnings, and hits. If vectors are absent or the Ollama query fails, it emits a warning and transfers semantic weight to lexical retrieval instead of silently reducing every score.
+
+If metadata claims a lexical backend whose table is missing, `query` reports an explicit fallback or `index-unavailable` warning. Re-run `index` instead of treating that empty result as evidence that the corpus has no answer.

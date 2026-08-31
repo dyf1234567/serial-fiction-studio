@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -103,6 +104,35 @@ class StoryWorkspaceTests(unittest.TestCase):
         changed = story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
         self.assertEqual(changed["changed_files"], 1)
 
+    def test_relative_reference_source_is_persisted_stably_and_missing_source_preserves_index(self):
+        first_cwd = Path(self.temp.name) / "first-cwd"
+        second_cwd = Path(self.temp.name) / "second-cwd"
+        corpus = first_cwd / "corpus"
+        corpus.mkdir(parents=True)
+        second_cwd.mkdir()
+        (corpus / "设定.md").write_text("星陨钥匙只在北境旧塔出现。", encoding="utf-8")
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(first_cwd)
+            first = story.command_index(Namespace(root=str(self.root), source=["corpus"], embeddings="none", model=None, endpoint=None, ann=None))
+            manifest = story.load_json(self.root / ".storywork" / "manifest.json")
+            self.assertEqual(manifest["index_sources"], [str(corpus.resolve())])
+            self.assertEqual(first["files"], 1)
+
+            os.chdir(second_cwd)
+            second = story.command_index(Namespace(root=str(self.root), source=None, embeddings=None, model=None, endpoint=None, ann=None))
+            self.assertEqual(second["files"], 1)
+            self.assertEqual(second["removed_files"], 0)
+            self.assertTrue(story.search_index(self.root, "星陨钥匙", 3, 1.0, 0.0))
+
+            (corpus / "设定.md").unlink()
+            corpus.rmdir()
+            with self.assertRaisesRegex(story.StoryError, "参考源不存在"):
+                story.command_index(Namespace(root=str(self.root), source=None, embeddings=None, model=None, endpoint=None, ann=None))
+            self.assertTrue(story.search_index(self.root, "星陨钥匙", 3, 1.0, 0.0))
+        finally:
+            os.chdir(original_cwd)
+
     def test_missing_fts5_uses_scan_and_semantic_weight_is_reported_and_transferred(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
         (self.chapters / "第0001章.md").write_text("守门人把赤铜钥匙交给沈星。", encoding="utf-8")
@@ -119,6 +149,23 @@ class StoryWorkspaceTests(unittest.TestCase):
         self.assertTrue(report["warnings"])
         self.assertTrue(report["hits"])
         self.assertAlmostEqual(report["hits"][0]["score"], 1.0)
+
+    def test_missing_declared_fts_table_is_reported_as_unavailable(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第0001章.md").write_text("守门人把赤铜钥匙交给沈星。", encoding="utf-8")
+        built = story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        if built["lexical_backend"] != "fts5":
+            self.skipTest("当前 Python 没有 FTS5")
+        con = story.connect_db(self.root)
+        con.execute("DROP TABLE docs_fts")
+        con.commit()
+        con.close()
+        report = story.search_index_report(self.root, "赤铜钥匙", 3, 0.65, 0.35)
+        self.assertEqual(report["mode"], "index-unavailable")
+        self.assertEqual(report["lexical_backend"], "unavailable")
+        self.assertEqual(report["effective_weights"], {"lexical": 0.0, "semantic": 0.0})
+        self.assertEqual(report["hits"], [])
+        self.assertTrue(any("词法索引表不存在" in warning and "index" in warning for warning in report["warnings"]))
 
     def test_ollama_query_failure_falls_back_with_warning(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
@@ -159,6 +206,27 @@ class StoryWorkspaceTests(unittest.TestCase):
         applied = story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
         self.assertEqual(applied["applied"], 1)
         self.assertEqual(story.load_events(self.root)[0]["kind"], "chapter")
+        (self.chapters / "第1章-起点.md").write_text("# 第1章 起点\n\n被修改的版本。", encoding="utf-8")
+        repeated = story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
+        self.assertEqual(repeated["applied"], 0)
+        self.assertIn("已有接受记录", repeated["skipped"][0]["reason"])
+
+    def test_begin_and_accept_reject_an_already_occupied_chapter_number(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        (self.chapters / "第3章-旧稿.md").write_text("# 第3章\n\n旧稿。", encoding="utf-8")
+        story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
+        with self.assertRaisesRegex(story.StoryError, "第 3 章已有接受记录"):
+            story.command_begin(Namespace(root=str(self.root), chapter=3, goal="重写第三章", query="旧稿", limit=2, out=None))
+
+        session = story.command_begin(Namespace(root=str(self.root), chapter=4, goal="写第四章", query="第四章", limit=2, out=None))
+        draft = self.root / "draft-4.md"
+        draft.write_text("第四章新稿。" * 100, encoding="utf-8")
+        story.command_review(Namespace(root=str(self.root), session=session["session"], draft=str(draft)))
+        (self.chapters / "第4章-并发收编.md").write_text("# 第4章\n\n另一份正文。", encoding="utf-8")
+        story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
+        with self.assertRaisesRegex(story.StoryError, "第 4 章已有接受记录"):
+            story.command_accept(Namespace(root=str(self.root), session=session["session"], draft=str(draft), confirm=session["session"]))
+        self.assertFalse((self.chapters / "第0004章.md").exists())
 
     def test_accept_requires_review_and_exact_confirmation(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
@@ -193,15 +261,106 @@ class StoryWorkspaceTests(unittest.TestCase):
         story.command_review(Namespace(root=str(self.root), session=session["session"], draft=str(draft)))
         story.command_accept(Namespace(root=str(self.root), session=session["session"], draft=str(draft), confirm=session["session"]))
         events_path = self.root / "events.json"
+        events_path.write_text(json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "status", "value": "dead", "evidence": "沈星明确说过自己永远不会死。", "confidence": 0.99, "risk": "high"}], ensure_ascii=False), encoding="utf-8")
+        with self.assertRaisesRegex(story.StoryError, "不是已接受正文"):
+            story.command_stage_events(Namespace(root=str(self.root), session=session["session"], events=str(events_path)))
         events_path.write_text(json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "location", "value": "北塔", "evidence": "沈星抵达北塔。", "confidence": 0.95}], ensure_ascii=False), encoding="utf-8")
         staged = story.command_stage_events(Namespace(root=str(self.root), session=session["session"], events=str(events_path)))
         self.assertEqual(staged["events"], 1)
         self.assertEqual(len(story.load_events(self.root)), 1)
         with self.assertRaises(story.StoryError):
             story.command_approve_events(Namespace(root=str(self.root), session=session["session"], confirm="wrong"))
+        proposal_path = self.root / ".storywork" / "sessions" / session["session"] / "event-proposal.json"
+        proposal = story.load_json(proposal_path)
+        proposal["events"][0]["evidence"] = "暂存后被替换的虚假引文。"
+        story.write_json(proposal_path, proposal)
+        with self.assertRaisesRegex(story.StoryError, "不是已接受正文"):
+            story.command_approve_events(Namespace(root=str(self.root), session=session["session"], confirm=session["session"]))
+        story.command_stage_events(Namespace(root=str(self.root), session=session["session"], events=str(events_path)))
         approved = story.command_approve_events(Namespace(root=str(self.root), session=session["session"], confirm=session["session"]))
         self.assertEqual(approved["applied"], 1)
         self.assertEqual(len(story.load_events(self.root)), 2)
+
+    def test_user_json_supports_windows_encodings_and_cli_errors_are_clean(self):
+        story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        session = story.command_begin(Namespace(root=str(self.root), chapter=1, goal="开始", query="开始", limit=2, out=None))
+        draft = self.root / "draft.md"
+        draft.write_text("沈星抵达北塔。" * 100, encoding="utf-8")
+        story.command_review(Namespace(root=str(self.root), session=session["session"], draft=str(draft)))
+        story.command_accept(Namespace(root=str(self.root), session=session["session"], draft=str(draft), confirm=session["session"]))
+        event_json = json.dumps([{"kind": "fact", "subject": "沈星", "predicate": "location", "value": "北塔", "evidence": "沈星抵达北塔。", "confidence": 0.95}], ensure_ascii=False)
+
+        for name, payload in (
+            ("utf8-bom.json", event_json.encode("utf-8-sig")),
+            ("utf16le.json", event_json.encode("utf-16-le")),
+            ("gb18030.json", event_json.encode("gb18030")),
+        ):
+            path = self.root / name
+            path.write_bytes(payload)
+            completed = subprocess.run(
+                [sys.executable, str(MODULE_PATH), "stage-events", str(self.root), "--session", session["session"], "--events", str(path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode("utf-8"))
+
+        invalid_json = self.root / "invalid.json"
+        invalid_json.write_text("这不是 JSON", encoding="utf-8")
+        bad_chapter = self.root / "bad-chapter.json"
+        bad_chapter.write_text(json.dumps({"chapter": "第一章"}, ensure_ascii=False), encoding="utf-8")
+        audit = story.command_audit_pack(Namespace(root=str(self.root), scope="volume", from_chapter=1, to_chapter=1, batch_size=1))
+        commands = [
+            ["stage-events", str(self.root), "--session", session["session"], "--events", str(invalid_json)],
+            ["plan-set", str(self.root), "--chapter", "1", "--plan", str(bad_chapter), "--confirm", "PLAN-1"],
+            ["outcome-set", str(self.root), "--session", session["session"], "--outcome", str(invalid_json), "--confirm", session["session"]],
+            ["audit-submit", str(self.root), "--audit", audit["audit"], "--batch", "1", "--findings", str(invalid_json)],
+        ]
+        for command in commands:
+            completed = subprocess.run([sys.executable, str(MODULE_PATH), *command], stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+            stderr = completed.stderr.decode("utf-8")
+            self.assertEqual(completed.returncode, 2, stderr)
+            self.assertTrue(stderr.startswith("error: "), stderr)
+            self.assertNotIn("Traceback", stderr)
+
+    def test_begin_out_is_project_relative_and_never_overwrites(self):
+        story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        elsewhere = Path(self.temp.name) / "elsewhere"
+        elsewhere.mkdir()
+        previous = Path.cwd()
+        try:
+            os.chdir(elsewhere)
+            session = story.command_begin(Namespace(root=str(self.root), chapter=1, goal="开始", query="开始", limit=2, out="上下文/第一章.md"))
+        finally:
+            os.chdir(previous)
+        expected = (self.root / "上下文" / "第一章.md").resolve()
+        self.assertEqual(Path(session["context"]), expected)
+        self.assertTrue(expected.exists())
+        expected.write_text("重要文件，不得覆盖。", encoding="utf-8")
+        sessions_dir = self.root / ".storywork" / "sessions"
+        before = {path.name for path in sessions_dir.iterdir()}
+        with self.assertRaisesRegex(story.StoryError, "拒绝覆盖"):
+            story.command_begin(Namespace(root=str(self.root), chapter=2, goal="继续", query="继续", limit=2, out="上下文/第一章.md"))
+        self.assertEqual(expected.read_text(encoding="utf-8"), "重要文件，不得覆盖。")
+        self.assertEqual({path.name for path in sessions_dir.iterdir()}, before)
+
+    def test_begin_compacts_large_snapshot_and_reports_omissions(self):
+        snapshot = {
+            "built_at": "test",
+            "facts": [{"subject": f"人物{i}", "predicate": "状态", "value": "很长的确认事实" * 12, "chapter": i} for i in range(2000)],
+            "setups": [{"id": f"setup-{i}", "subject": f"伏笔{i}", "predicate": "用途", "value": "尚未回收的线索" * 10, "chapter": i, "status": "open"} for i in range(400)],
+            "decisions": [{"predicate": f"决定{i}", "value": "继续遵守创作决定" * 10, "chapter": i} for i in range(50)],
+            "chapters": [],
+        }
+        story.write_json(self.root / ".storywork" / "snapshot.json", snapshot)
+        story.build_index(self.root, [], "none", "bge-m3", "http://127.0.0.1:11434")
+        result = story.command_begin(Namespace(root=str(self.root), chapter=1, goal="开始", query="开始", limit=2, out=None))
+        context = Path(result["context"]).read_text(encoding="utf-8")
+        self.assertLess(len(context), 26000)
+        self.assertIn("上下文压缩说明", context)
+        self.assertGreater(result["memory_context"]["sections"]["facts"]["omitted"], 0)
+        self.assertGreater(result["memory_context"]["sections"]["setups"]["omitted"], 0)
+        self.assertEqual(len(story.load_json(self.root / ".storywork" / "snapshot.json")["facts"]), 2000)
 
     def test_structured_audit_and_semantic_audit_batches(self):
         self.record("fact", "沈星", "age", "20", 1)
@@ -219,12 +378,28 @@ class StoryWorkspaceTests(unittest.TestCase):
         finalized = story.command_audit_finalize(Namespace(root=str(self.root), audit=pack["audit"]))
         self.assertEqual(finalized["counts"]["risk"], 2)
 
+    def test_audit_reports_missing_and_orphan_manuscript_files(self):
+        self.chapters.mkdir(parents=True, exist_ok=True)
+        accepted_path = self.chapters / "第1章-已收编.md"
+        accepted_path.write_text("# 第1章\n\n已收编正文。", encoding="utf-8")
+        story.command_adopt(Namespace(root=str(self.root), apply=True, confirm="ADOPT"))
+        accepted_path.unlink()
+        orphan_path = self.chapters / "第0019章.md"
+        orphan_path.write_text("# 第19章\n\n未收编正文。", encoding="utf-8")
+        report = story.command_audit(Namespace(root=str(self.root), setup_age=30))
+        messages = [item["message"] for item in report["findings"]]
+        self.assertTrue(any("已接受正文文件已丢失" in message and accepted_path.name in message for message in messages))
+        self.assertTrue(any("孤儿章节" in message and orphan_path.name in message for message in messages))
+
     def test_backup_round_trip_verification(self):
         self.chapters.mkdir(parents=True, exist_ok=True)
         (self.chapters / "第1章.md").write_text("# 第1章\n\n正文。", encoding="utf-8")
+        story.write_json(self.root / ".storywork" / "pacing.json", {"generated_at": "test", "chapters": []})
         archive = self.root / "backup.sfs.zip"
         result = story.command_backup(Namespace(root=str(self.root), out=str(archive), include_context=False))
         self.assertGreater(result["files"], 0)
+        with story.zipfile.ZipFile(archive, "r") as handle:
+            self.assertIn("storywork/pacing.json", handle.namelist())
         verified = story.command_verify_backup(Namespace(archive=str(archive)))
         self.assertTrue(verified["valid"])
 
@@ -277,11 +452,14 @@ class StoryWorkspaceTests(unittest.TestCase):
         after = story.command_pacing(Namespace(root=str(self.root), window=10))
         self.assertEqual([item["chapter"] for item in after["chapters"]], [1])
         self.assertEqual(after["coverage"], 1.0)
-        second_session = story.command_begin(Namespace(root=str(self.root), chapter=1, goal="备选修订", query="北塔", limit=2, out=None))
+        second_plan_path = self.write_plan(chapter=2)
+        story.command_plan_set(Namespace(root=str(self.root), chapter=2, plan=str(second_plan_path), confirm="PLAN-2"))
+        second_session = story.command_begin(Namespace(root=str(self.root), chapter=2, goal="下一章", query="北塔", limit=2, out=None))
         second_draft = self.root / "second-draft.md"
         second_draft.write_text("沈星抵达北塔后重新观察城门。" * 80, encoding="utf-8")
         story.command_review(Namespace(root=str(self.root), session=second_session["session"], draft=str(second_draft)))
         second_outcome = dict(outcome)
+        second_outcome["chapter"] = 2
         second_outcome["actual_characters"] = 1200
         outcome_path.write_text(json.dumps(second_outcome, ensure_ascii=False), encoding="utf-8")
         story.command_outcome_set(Namespace(root=str(self.root), session=second_session["session"], outcome=str(outcome_path), confirm=second_session["session"]))

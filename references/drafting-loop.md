@@ -8,7 +8,9 @@ For a planned chapter, create the lightweight plan described in [planning.md](pl
 python scripts/story_workspace.py begin <root> --chapter 18 --goal "主角从地牢脱身，但不揭露银戒来历" --query "地牢 银戒 守卫" --out context.md
 ```
 
-The pack separates current facts, open setups, decisions, recent manuscript, and retrieved evidence. Inspect it before drafting.
+The pack separates current facts, open setups, decisions, recent manuscript, and retrieved evidence. Its memory section is a bounded working set; if facts, setups, or decisions are omitted, the pack reports counts and points back to the complete `.storywork/snapshot.json`. Inspect it before drafting and use targeted retrieval or a full audit when an omitted area matters.
+
+A relative `--out` path is resolved from the novel root, not the shell's current directory. `begin` refuses to overwrite an existing output file and does not create a session when that check fails.
 
 ## Draft and review
 
